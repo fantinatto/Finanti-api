@@ -13,15 +13,18 @@ datasource db {
 // ============================================
 
 model User {
-  uuid_usuario String   @id @default(uuid())
+  uuid_usuario String    @id @default(uuid())
   displayName  String
-  primaryEmail String   @unique
+  primaryEmail String    @unique
   passwordHash String?
   avatarUrl    String?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  birthDate    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 
   passwordResetTokens PasswordResetToken[]
+  portfolioConfig     PortfolioConfig?
+  investimentos       Investimento[]
 
   @@map("users")
 }
@@ -36,4 +39,261 @@ model PasswordResetToken {
   createdAt DateTime  @default(now())
 
   @@map("password_reset_tokens")
+}
+
+// ============================================
+// MARKET DATA - Ranking e Scoring de Ações
+// ============================================
+
+model Acao {
+  ticker    String   @id
+  nome      String
+  setor     String?
+  subsetor  String?
+  segmento  String?
+  updatedAt DateTime @updatedAt
+
+  indicadores IndicadorMensal[]
+  scores      ScoreNormalizado[]
+
+  @@map("acoes")
+}
+
+/// Cache persistente de ticker → setor, desacoplado da validação de fundamentos completos
+/// (Acao só é atualizada pra ações com campos mínimos presentes). Só insert/update, nunca delete.
+/// Serve de fallback quando a fonte de dados da vez não retorna setor pro ticker (ex: bolsai).
+model TickerSetor {
+  ticker    String   @id
+  setor     String
+  subsetor  String?
+  segmento  String?
+  updatedAt DateTime @updatedAt
+
+  @@map("ticker_setor")
+}
+
+model IndicadorMensal {
+  id     String @id @default(uuid())
+  ticker String
+  acao   Acao   @relation(fields: [ticker], references: [ticker], onDelete: Cascade)
+  anoMes String // "2025-08"
+
+  // Valuation (menor = melhor; excluir negativos da média)
+  pl    Float?
+  pvp   Float?
+  pEbit Float?
+
+  // Rentabilidade (maior = melhor; ROE/ROIC negativos excluídos)
+  roe           Float?
+  roic          Float?
+  roa           Float?
+  margemBruta   Float?
+  margemEbit    Float?
+  margemLiquida Float?
+
+  // Dividendos (maior = melhor)
+  dy Float?
+
+  // Endividamento (menor = melhor; negativo = caixa líquido = bom)
+  dividaLiquidaPatrimonio Float?
+  dividaLiquidaEbitda     Float?
+
+  // Crescimento (maior = melhor)
+  cagrReceita5a Float?
+  cagrLucro5a   Float?
+
+  // Básicos
+  lpa Float?
+  vpa Float?
+
+  /// Cotação de fechamento do mês (Status Invest `price`) — não entra no score, é a
+  /// referência usada pra calcular ganho de carteira (precoMedio × quantidade vs isso).
+  precoFechamento Float?
+
+  /// Volume médio diário de negociação em R$ (Status Invest `liquidezmediadiaria`) — usado só
+  /// pro fator de penalização de liquidez aplicado em scoreFinal/scoreFinalDelta (ver
+  /// scoring/liquidez.ts). Ausente em ~24% do universo mesmo pra blue chips líquidas (bug de
+  /// cobertura da fonte, confirmado com VIVT4) — null aqui NUNCA deve virar penalização máxima.
+  liquidezMediaDiaria Float?
+
+  /// true quando faltou algum dos campos mínimos (pl, pvp, lpa, vpa, roe, roa, pEbit)
+  /// mesmo depois de tentar completar com a API de fallback.
+  dadosIncompletos Boolean @default(false)
+
+  /// true quando pvp < 0 (patrimônio líquido negativo / passivo a descoberto) — sinal de
+  /// risco elevado que o scoreRisco já reflete (achatado pro piso em calcularScores), mas
+  /// fica exposto aqui como flag pra a UI destacar sem depender de reler o valor de pvp.
+  passivoADescoberto Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@unique([ticker, anoMes])
+  @@map("indicadores_mensais")
+}
+
+model MediaAgrupamento {
+  id        String   @id @default(uuid())
+  tipoGrupo String   // "setor" | "subsetor" | "segmento" | "geral"
+  nomeGrupo String
+  anoMes    String
+
+  pl                      Float?
+  pvp                     Float?
+  pEbit                   Float?
+  roe                     Float?
+  roic                    Float?
+  roa                     Float?
+  margemBruta             Float?
+  margemEbit              Float?
+  margemLiquida           Float?
+  dy                      Float?
+  dividaLiquidaPatrimonio Float?
+  dividaLiquidaEbitda     Float?
+  cagrReceita5a           Float?
+  cagrLucro5a             Float?
+
+  createdAt DateTime @default(now())
+
+  @@unique([tipoGrupo, nomeGrupo, anoMes])
+  @@map("medias_agrupamento")
+}
+
+model ScoreNormalizado {
+  id        String @id @default(uuid())
+  ticker    String
+  acao      Acao   @relation(fields: [ticker], references: [ticker], onDelete: Cascade)
+  tipoGrupo String // "setor" | "segmento" | "geral"
+  nomeGrupo String
+  anoMes    String
+
+  // Valores normalizados por indicador
+  pl_norm                      Float?
+  pvp_norm                     Float?
+  pEbit_norm                   Float?
+  roe_norm                     Float?
+  roic_norm                    Float?
+  roa_norm                     Float?
+  margemBruta_norm             Float?
+  margemEbit_norm              Float?
+  margemLiquida_norm           Float?
+  dy_norm                      Float?
+  dividaLiquidaPatrimonio_norm Float?
+  dividaLiquidaEbitda_norm     Float?
+  cagrReceita5a_norm           Float?
+  cagrLucro5a_norm             Float?
+
+  // Scores compostos
+  scoreQualidade Float?
+  scoreRisco     Float?
+  scorePreco     Float?
+  scoreFinal     Float?
+
+  /// Comparativo experimental a scoreRisco: mesmos campos/pesos por setor, mas normalizados
+  /// por Z-score + sigmoide (curva contínua 0–3) em vez de razão com teto/piso rígido em
+  /// 0.1/3.0. Não é sinal temporal (mesmo mês, mesmo dado bruto que scoreRisco) — só um
+  /// método de normalização alternativo. Exposto pra diagnóstico junto de scoreRisco.
+  riscoDelta Float?
+
+  /// 60% scoreRisco + 40% riscoDelta — é o que de fato entra no scoreFinal a partir de agora
+  /// (não scoreRisco puro). Suaviza o efeito de teto/piso rígido sem descartar a fórmula
+  /// original; scoreRisco continua exposto sem alteração pra quem quiser comparar.
+  riscoComposto Float?
+
+  /// Comparativo experimental a scoreQualidade — mesmos campos/pesos por setor, mas
+  /// normalizados por Z-score + sigmoide em vez de razão contra a mediana do grupo.
+  qualidadeDelta Float?
+
+  /// Comparativo experimental a scorePreco — mesma normalização Z-score + sigmoide.
+  precoDelta Float?
+
+  /// scoreFinal 100% baseado nos deltas (qualidadeDelta + riscoDelta puro + precoDelta,
+  /// mesmos SCORE_WEIGHTS) — pra comparar contra scoreFinal, que é baseado em razão/mediana
+  /// (com riscoComposto no eixo risco). Não substitui scoreFinal, é só pra diagnóstico lado a lado.
+  scoreFinalDelta Float?
+
+  createdAt DateTime @default(now())
+
+  @@unique([ticker, tipoGrupo, nomeGrupo, anoMes])
+  @@map("scores_normalizados")
+}
+
+// ============================================
+// PORTFOLIO - Perfil de rebalanceamento de carteira
+// ============================================
+
+model PortfolioConfig {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  percentualRendaFixa Float // % em renda fixa; renda variável = 100 - este valor
+  percentualFiis      Float // dentro da renda variável
+  percentualAcoes     Float // dentro da renda variável (percentualFiis + percentualAcoes = 100)
+  percentualEstouro   Float // gatilho de rebalanceamento (só armazenado — motor de alerta é trabalho futuro)
+
+  /// "base80" | "base100" | "base110" | "base120" | "base_di" | null (alocação 100% manual)
+  regraSelecionada String?
+  /// permite uma base fora dos presets (80/100/110/120) quando regraSelecionada indicar uma regra genérica
+  baseRegraCustom  Int?
+
+  /// "setor" | "segmento" | "geral" | "hibrido" — qual ranking as recomendações de troca/aporte
+  /// em Investimentos usam pra comparar ações e escolher a "melhor do grupo". Não afeta o
+  /// rebalanceamento por valor (sempre por setor, via AlocacaoSetor) — só a ESCOLHA de ticker.
+  tipoRankingRecomendacao String @default("setor")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  alocacoesSetor       AlocacaoSetor[]
+  alocacoesSegmentoFii AlocacaoSegmentoFii[]
+
+  @@map("portfolio_config")
+}
+
+model AlocacaoSetor {
+  id                String          @id @default(uuid())
+  portfolioConfigId String
+  portfolioConfig   PortfolioConfig @relation(fields: [portfolioConfigId], references: [id], onDelete: Cascade)
+  setor             String
+  percentual        Float
+
+  @@unique([portfolioConfigId, setor])
+  @@map("alocacoes_setor")
+}
+
+/// Segmento é uma lista provisória fixa no front (Lajes Corporativas, Shoppings, Logística,
+/// Papel/CRI, Híbrido, Fundo de Fundos, Outros) até existir ingestão real de fundamentos de FIIs.
+model AlocacaoSegmentoFii {
+  id                String          @id @default(uuid())
+  portfolioConfigId String
+  portfolioConfig   PortfolioConfig @relation(fields: [portfolioConfigId], references: [id], onDelete: Cascade)
+  segmento          String
+  percentual        Float
+
+  @@unique([portfolioConfigId, segmento])
+  @@map("alocacoes_segmento_fii")
+}
+
+/// Posição real do usuário (não confundir com PortfolioConfig, que é só a alocação-alvo).
+/// Usado pra comparar alocação real vs alvo e calcular ganho mês a mês contra a cotação
+/// que a ingestão de market-data captura (IndicadorMensal.precoFechamento).
+model Investimento {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  /// "acao" | "fii" | "renda_fixa"
+  tipo String
+
+  /// Ticker B3 — null pra renda fixa (não tem cotação de mercado pra puxar do ranking)
+  ticker String?
+  nome   String
+
+  precoMedio Float
+  quantidade Float
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("investimentos")
 }
