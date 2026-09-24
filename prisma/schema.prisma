@@ -25,6 +25,9 @@ model User {
   passwordResetTokens PasswordResetToken[]
   portfolioConfig     PortfolioConfig?
   investimentos       Investimento[]
+  transacoesSimulacao TransacaoSimulacao[]
+  simulacaoConfig     SimulacaoConfig?
+  historicoCarteira   HistoricoCarteira[]
 
   @@map("users")
 }
@@ -194,9 +197,12 @@ model ScoreNormalizado {
   /// método de normalização alternativo. Exposto pra diagnóstico junto de scoreRisco.
   riscoDelta Float?
 
-  /// 60% scoreRisco + 40% riscoDelta — é o que de fato entra no scoreFinal a partir de agora
-  /// (não scoreRisco puro). Suaviza o efeito de teto/piso rígido sem descartar a fórmula
-  /// original; scoreRisco continua exposto sem alteração pra quem quiser comparar.
+  /// riscoDelta como principal (fallback pra scoreRisco só quando Δ é null, ex: grupo pequeno
+  /// demais pra Z-score) — é o que de fato entra no scoreFinal, não scoreRisco puro. Era um
+  /// blend 60% scoreRisco + 40% riscoDelta até 2026-09-23; trocado depois de confirmar com
+  /// dados reais que o clamp rígido do clássico (dividaLiquidaPatrimonio com negativeIsGood)
+  /// dá nota máxima idêntica pra qualquer dívida líquida baixa, sem diferenciar grau.
+  /// scoreRisco continua exposto sem alteração pra quem quiser comparar.
   riscoComposto Float?
 
   /// Comparativo experimental a scoreQualidade — mesmos campos/pesos por setor, mas
@@ -241,6 +247,10 @@ model PortfolioConfig {
   /// rebalanceamento por valor (sempre por setor, via AlocacaoSetor) — só a ESCOLHA de ticker.
   tipoRankingRecomendacao String @default("setor")
 
+  /// Quando false, recomendações de compra/venda (e sua execução na Simulação) só consideram
+  /// múltiplos de 100 ações (lote-padrão B3) em vez de qualquer quantidade fracionária.
+  permiteFracionario Boolean @default(true)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -282,6 +292,10 @@ model Investimento {
   userId String
   user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
 
+  /// "real" | "simulacao" — mesma estrutura de posição, carteiras isoladas por usuário.
+  /// Default "real" preserva 100% dos registros existentes antes desta coluna existir.
+  carteira String @default("real")
+
   /// "acao" | "fii" | "renda_fixa"
   tipo String
 
@@ -295,5 +309,85 @@ model Investimento {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@index([userId, carteira])
   @@map("investimentos")
+}
+
+/// Log de auditoria de cada mutação aplicada à carteira de simulação (venda/compra, disparada
+/// por "Executar Recomendação" ou pelo aporte semanal) — sem isso a simulação seria uma
+/// caixa-preta sem histórico de o que foi feito e quando.
+model TransacaoSimulacao {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  anoMes String // competência usada pra cotação/score no momento da execução
+
+  /// "venda" | "compra"
+  tipo       String
+  ticker     String
+  quantidade Float
+  preco      Float // IndicadorMensal.precoFechamento no anoMes, usado como preço de execução
+  valor      Float // quantidade * preco
+
+  /// "recomendacao" | "aporte_semanal" | "reinicio"
+  origem String
+  motivo String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, anoMes])
+  @@map("transacoes_simulacao")
+}
+
+/// Config operacional da simulação — separado de PortfolioConfig (que é alvo de alocação e
+/// vale igualmente pra carteira real; a simulação usa o MESMO alvo, não um alvo próprio).
+model SimulacaoConfig {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  aporteSemanalValor Float @default(0)
+
+  /// Valor apurado em vendas sem par de compra (categoria reducao_risco, que não tem
+  /// sugestaoTroca) — sem isso o valor "evaporava" da carteira simulada em vez de ficar
+  /// disponível pra investir depois. Excluído do cálculo de %-por-setor (não pertence a
+  /// nenhum setor), mas somado em valorTotal/valorInvestidoTotal do snapshot mensal.
+  caixaDisponivel Float @default(0)
+
+  /// Base pra contar quantas semanas se passaram desde o último aporte aplicado.
+  ultimoAporteAplicadoEm DateTime?
+  /// Base quando o aporte nunca foi aplicado (simulação recém-criada/reiniciada).
+  simulacaoIniciadaEm DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("simulacao_config")
+}
+
+/// Snapshot mensal de valor de carteira (base do gráfico de evolução) — um por
+/// [userId, carteira, anoMes], criado de forma preguiçosa (lazy) na primeira vez que a tela é
+/// aberta pra um anoMes que ainda não tem snapshot. Reflete o instante da 1ª visita ao mês, não
+/// necessariamente o fechamento do mês.
+model HistoricoCarteira {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  /// "real" | "simulacao"
+  carteira String
+  anoMes   String
+
+  valorTotal          Float
+  valorInvestidoTotal Float
+  valorPorAcoes       Float
+  valorPorFiis        Float
+  valorPorRendaFixa   Float
+  ganhoAcumulado      Float
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, carteira, anoMes])
+  @@map("historico_carteira")
 }

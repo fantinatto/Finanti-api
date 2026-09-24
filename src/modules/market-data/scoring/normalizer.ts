@@ -90,14 +90,20 @@ const RISCO_SAUDAVEL_MIN = 2.0;
 const RISCO_SEM_DADOS_NORM = 0.3;
 
 /**
- * Risco Composto = mistura Risco Estático (mediana/razão, com teto/piso rígido) com
- * riscoDelta (Z-score + sigmoide, curva contínua) — mesmo mês, mesma métrica bruta, só
- * método de normalização diferente. NÃO é sinal temporal/tendência (não temos histórico
- * de dívida entre meses pra isso); é só suavização do efeito de teto no Score Final.
- * scoreRisco e riscoDelta continuam expostos sem alteração pra diagnóstico separado.
+ * Risco Composto = o valor que de fato entra no scoreFinal pro eixo Risco. Até 2026-09-23 era
+ * um blend 60% scoreRisco (razão/mediana) + 40% riscoDelta (Z-score/sigmoide). Trocado pra
+ * "Δ como principal, clássico só como fallback" depois de comparar os dois sistemas com dados
+ * reais: dividaLiquidaEbitda vem null pra praticamente 100% do universo (Status Invest não
+ * fornece, bolsai tem cota escassa), então o eixo Risco clássico depende quase só de
+ * dividaLiquidaPatrimonio — e esse campo tem negativeIsGood:true (normalizarIndicador dá nota
+ * 3.0 fixa pra QUALQUER valor negativo, seja -0.02 ou -20) e também explode pra perto do teto
+ * quando positivo mas próximo de zero (razão média/valor sem limite antes do clamp). Resultado:
+ * qualquer empresa com dívida líquida baixa ganha a MESMA nota máxima do eixo Risco, sem
+ * diferenciar grau — confirmado batendo 13 de 16 tickers testados que trocavam de lugar entre
+ * os rankings clássico e delta. O Z-score não tem esse degrau (mede desvios-padrão da média,
+ * curva contínua), por isso vira o principal. scoreRisco e riscoDelta continuam expostos sem
+ * alteração pra diagnóstico separado (colunas "Risco" e "Risco Δ" em /ranking).
  */
-const RISCO_COMPOSTO_PESO_ESTATICO = 0.6;
-const RISCO_COMPOSTO_PESO_DELTA = 0.4;
 
 export function calcularScores(
   normsMap: IndicadoresMap,
@@ -207,10 +213,9 @@ export function calcularScores(
     riscoDelta = riscoDelta !== null ? Math.min(riscoDelta, NORM_CLAMP_MIN) : NORM_CLAMP_MIN;
   }
 
-  const riscoComposto =
-    riscoDelta !== null
-      ? (scoreRisco as number) * RISCO_COMPOSTO_PESO_ESTATICO + riscoDelta * RISCO_COMPOSTO_PESO_DELTA
-      : scoreRisco;
+  // Δ como principal — só cai pro clássico quando riscoDelta é null (grupo pequeno demais pra
+  // Z-score: n<2 valores válidos ou desvio-padrão zero em calcularMediaEDesvio).
+  const riscoComposto = riscoDelta ?? scoreRisco;
 
   const qualidadeDelta = estatisticasGrupo
     ? calcularScoreDeltaGrupo('qualidade', indicadores ?? {}, estatisticasGrupo, setor ?? null, segmento ?? null)

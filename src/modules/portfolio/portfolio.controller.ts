@@ -5,8 +5,12 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { PortfolioConfigService } from './services/portfolio-config.service';
 import { RebalancingRuleService } from './services/rebalancing-rule.service';
 import { InvestimentoService } from './services/investimento.service';
+import type { TipoCarteira } from './services/investimento.service';
+import { SimulacaoService } from './services/simulacao.service';
+import { HistoricoCarteiraService } from './services/historico-carteira.service';
 import { UpsertPortfolioConfigDto } from './dto/upsert-portfolio-config.dto';
 import { UpsertInvestimentoDto } from './dto/upsert-investimento.dto';
+import { UpsertSimulacaoConfigDto } from './dto/upsert-simulacao-config.dto';
 import { BASES_REGRA_PADRAO, CONTRATO_DI_FIXO, TAXA_DI_FIXA } from './rebalancing.config';
 
 @Controller('portfolio')
@@ -17,6 +21,8 @@ export class PortfolioController {
     private readonly config: PortfolioConfigService,
     private readonly regras: RebalancingRuleService,
     private readonly investimentos: InvestimentoService,
+    private readonly simulacao: SimulacaoService,
+    private readonly historicoCarteira: HistoricoCarteiraService,
   ) {}
 
   @Get('config')
@@ -73,12 +79,83 @@ export class PortfolioController {
 
   @Get('investimentos/ganhos')
   async ganhosInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
-    return this.investimentos.calcularGanhos(req['user'].sub, anoMes);
+    const userId = req['user'].sub;
+    await this.historicoCarteira.garantirSnapshotDoMes(userId, 'real', anoMes);
+    return this.investimentos.calcularGanhos(userId, anoMes);
   }
 
   @Get('investimentos/recomendacoes')
   async recomendacoesInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
     return this.investimentos.getRecomendacoes(req['user'].sub, anoMes);
+  }
+
+  @Get('historico')
+  async getHistorico(@Req() req: Request, @Query('carteira') carteira: TipoCarteira) {
+    return this.historicoCarteira.listarHistorico(req['user'].sub, carteira ?? 'real');
+  }
+
+  @Get('simulacao/config')
+  async getSimulacaoConfig(@Req() req: Request) {
+    return this.simulacao.getConfig(req['user'].sub);
+  }
+
+  @Put('simulacao/config')
+  async upsertSimulacaoConfig(@Req() req: Request, @Body() dto: UpsertSimulacaoConfigDto) {
+    return this.simulacao.upsertConfig(req['user'].sub, dto);
+  }
+
+  @Post('simulacao/reiniciar')
+  async reiniciarSimulacao(@Req() req: Request) {
+    await this.simulacao.reiniciar(req['user'].sub);
+    return { ok: true };
+  }
+
+  @Get('simulacao/investimentos')
+  async listarInvestimentosSimulacao(@Req() req: Request) {
+    return this.investimentos.listar(req['user'].sub, 'simulacao');
+  }
+
+  @Post('simulacao/investimentos')
+  async criarInvestimentoSimulacao(@Req() req: Request, @Body() dto: UpsertInvestimentoDto) {
+    return this.investimentos.criar(req['user'].sub, dto, 'simulacao');
+  }
+
+  @Put('simulacao/investimentos/:id')
+  async atualizarInvestimentoSimulacao(@Req() req: Request, @Param('id') id: string, @Body() dto: UpsertInvestimentoDto) {
+    return this.investimentos.atualizar(req['user'].sub, id, dto, 'simulacao');
+  }
+
+  @Delete('simulacao/investimentos/:id')
+  async removerInvestimentoSimulacao(@Req() req: Request, @Param('id') id: string) {
+    await this.investimentos.remover(req['user'].sub, id, 'simulacao');
+    return { ok: true };
+  }
+
+  @Get('simulacao/investimentos/ganhos')
+  async ganhosInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    const userId = req['user'].sub;
+    await this.historicoCarteira.garantirSnapshotDoMes(userId, 'simulacao', anoMes);
+    return this.investimentos.calcularGanhos(userId, anoMes, 'simulacao');
+  }
+
+  @Get('simulacao/investimentos/recomendacoes')
+  async recomendacoesInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getRecomendacoes(req['user'].sub, anoMes, 'simulacao');
+  }
+
+  @Post('simulacao/investimentos/:id/executar-recomendacao')
+  async executarRecomendacao(@Req() req: Request, @Param('id') id: string, @Query('anoMes') anoMes: string) {
+    return this.simulacao.executarRecomendacao(req['user'].sub, id, anoMes);
+  }
+
+  @Post('simulacao/aplicar-aporte')
+  async aplicarAporteSemanal(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.simulacao.aplicarAporteSemanal(req['user'].sub, anoMes);
+  }
+
+  @Post('simulacao/investir-caixa')
+  async investirCaixa(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.simulacao.investirCaixa(req['user'].sub, anoMes);
   }
 
   private async getIdadeUsuario(userId: string): Promise<number> {

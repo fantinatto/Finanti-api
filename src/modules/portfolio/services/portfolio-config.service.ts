@@ -26,6 +26,7 @@ export class PortfolioConfigService {
           regraSelecionada: dto.regraSelecionada,
           baseRegraCustom: dto.baseRegraCustom,
           tipoRankingRecomendacao: dto.tipoRankingRecomendacao ?? 'setor',
+          permiteFracionario: dto.permiteFracionario ?? true,
         },
         update: {
           percentualRendaFixa: dto.percentualRendaFixa,
@@ -35,6 +36,7 @@ export class PortfolioConfigService {
           regraSelecionada: dto.regraSelecionada ?? null,
           baseRegraCustom: dto.baseRegraCustom ?? null,
           tipoRankingRecomendacao: dto.tipoRankingRecomendacao ?? 'setor',
+          permiteFracionario: dto.permiteFracionario ?? true,
         },
       });
 

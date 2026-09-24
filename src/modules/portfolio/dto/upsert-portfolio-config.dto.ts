@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min, ValidateNested } from 'class-validator';
+import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, Min, ValidateNested } from 'class-validator';
 
 export class AlocacaoItemDto {
   @IsString()
@@ -46,6 +46,11 @@ export class UpsertPortfolioConfigDto {
   @IsOptional()
   @IsIn(TIPOS_RANKING_VALIDOS)
   tipoRankingRecomendacao?: (typeof TIPOS_RANKING_VALIDOS)[number];
+
+  /** false = recomendações e execuções na Simulação só operam em múltiplos de 100 ações. */
+  @IsOptional()
+  @IsBoolean()
+  permiteFracionario?: boolean;
 
   @IsArray()
   @ValidateNested({ each: true })

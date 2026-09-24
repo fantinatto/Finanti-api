@@ -50,8 +50,8 @@ export const INDICATOR_CONFIG: IndicatorConfig[] = [
 ];
 
 export const SCORE_WEIGHTS: Record<ScoreGroup, number> = {
-  qualidade: 0.50,
-  risco: 0.30,
+  qualidade: 0.40,
+  risco: 0.40,
   preco: 0.20,
 };
 
