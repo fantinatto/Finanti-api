@@ -3,13 +3,13 @@ import { Prisma, TransacaoSimulacao } from '@prisma/client';
 import { PrismaService } from '../../../common/prisma/prisma.service';
 import { InvestimentoService } from './investimento.service';
 import { UpsertSimulacaoConfigDto } from '../dto/upsert-simulacao-config.dto';
-import { arredondarParaLote } from './lote';
+import { UpsertInvestimentoDto } from '../dto/upsert-investimento.dto';
+import { arredondarParaLote, TAMANHO_FRACIONARIO, TAMANHO_LOTE } from './lote';
 
 /**
  * Únicas categorias de RecomendacaoHolding que representam uma venda real hoje.
- * 'aporte_direcionado'/'aportar' orientam pra onde mandar o PRÓXIMO aporte — não uma ordem de
- * venda da posição atual (ver decisão registrada no plano da feature). Vender aqui criaria
- * dinheiro do nada na simulação.
+ * 'aportar' orienta pra onde mandar o PRÓXIMO aporte — não uma ordem de venda da posição atual
+ * (ver decisão registrada no plano da feature). Vender aqui criaria dinheiro do nada na simulação.
  */
 const CATEGORIAS_EXECUTAVEIS = new Set(['venda_prioritaria', 'reducao_risco', 'troca_sugerida']);
 /** Abaixo disso a posição residual após uma venda é considerada zerada (ruído de ponto flutuante). */
@@ -40,6 +40,104 @@ export class SimulacaoService {
       where: { userId },
       update: { aporteSemanalValor: dto.aporteSemanalValor },
       create: { userId, aporteSemanalValor: dto.aporteSemanalValor },
+    });
+  }
+
+  /**
+   * Cadastro manual de posição em Simulação (botão "Adicionar"/"Comprar") — diferente da carteira
+   * real, aqui o valor investido (quantidade × precoMedio) sai do caixa disponível, senão a
+   * compra "cria dinheiro do nada": o caixa só mudava em venda/aporte/executar-recomendação, nunca
+   * quando o usuário registrava uma compra manual.
+   *
+   * Também grava TransacaoSimulacao (origem='manual') — é o único jeito do usuário ter um log de
+   * "o que eu faria na carteira real" pra replicar manualmente lá (pedido explícito: um botão de
+   * Adicionar sem rastro não dá pra reconstruir depois). `atualizar()` (edição) deliberadamente
+   * NÃO gera transação — é tratado como correção da posição, não uma operação nova, mesmo
+   * critério já usado em Fiscal (ver docs/FEATURE_SPEC_FISCAL.md seção 2).
+   */
+  async criar(userId: string, dto: UpsertInvestimentoDto, anoMes?: string) {
+    const valorCompra = dto.quantidade * dto.precoMedio;
+    const ticker = dto.tipo === 'renda_fixa' ? null : (dto.ticker?.toUpperCase() ?? null);
+
+    return this.prisma.$transaction(async (tx) => {
+      // Reforço de posição já existente (mesmo ticker/tipo) — soma quantidade e recalcula preço
+      // médio ponderado, mesmo mecanismo de comprarOuReforcar; não é uma posição nova.
+      const existente = ticker
+        ? await tx.investimento.findFirst({ where: { userId, carteira: 'simulacao', tipo: dto.tipo, ticker } })
+        : null;
+
+      const investimento = existente
+        ? await tx.investimento.update({
+            where: { id: existente.id },
+            data: {
+              quantidade: existente.quantidade + dto.quantidade,
+              precoMedio:
+                (existente.quantidade * existente.precoMedio + dto.quantidade * dto.precoMedio) /
+                (existente.quantidade + dto.quantidade),
+            },
+          })
+        : await tx.investimento.create({
+            data: {
+              userId,
+              carteira: 'simulacao',
+              tipo: dto.tipo,
+              ticker,
+              nome: dto.nome,
+              precoMedio: dto.precoMedio,
+              quantidade: dto.quantidade,
+            },
+          });
+      if (valorCompra !== 0) {
+        await tx.simulacaoConfig.upsert({
+          where: { userId },
+          update: { caixaDisponivel: { decrement: valorCompra } },
+          create: { userId, caixaDisponivel: -valorCompra },
+        });
+      }
+      if (ticker) {
+        await this.registrarTransacao(tx, {
+          userId,
+          anoMes: anoMes ?? new Date().toISOString().slice(0, 7),
+          tipo: 'compra',
+          ticker,
+          quantidade: dto.quantidade,
+          preco: dto.precoMedio,
+          origem: 'manual',
+          motivo: null,
+        });
+      }
+      return investimento;
+    });
+  }
+
+  /**
+   * Edição manual de posição em Simulação — debita/credita o caixa pela VARIAÇÃO do valor
+   * investido (novo − antigo), não pelo valor novo inteiro: reforçar (aumentar) debita como uma
+   * compra, reduzir credita de volta (mesmo efeito de uma venda manual parcial via edição).
+   */
+  async atualizar(userId: string, id: string, dto: UpsertInvestimentoDto) {
+    const atual = await this.investimentos.garantirDono(userId, id, 'simulacao');
+    const delta = dto.quantidade * dto.precoMedio - atual.quantidade * atual.precoMedio;
+
+    return this.prisma.$transaction(async (tx) => {
+      const investimento = await tx.investimento.update({
+        where: { id },
+        data: {
+          tipo: dto.tipo,
+          ticker: dto.tipo === 'renda_fixa' ? null : (dto.ticker?.toUpperCase() ?? null),
+          nome: dto.nome,
+          precoMedio: dto.precoMedio,
+          quantidade: dto.quantidade,
+        },
+      });
+      if (delta !== 0) {
+        await tx.simulacaoConfig.upsert({
+          where: { userId },
+          update: { caixaDisponivel: { decrement: delta } },
+          create: { userId, caixaDisponivel: -delta },
+        });
+      }
+      return investimento;
     });
   }
 
@@ -103,11 +201,30 @@ export class SimulacaoService {
     // valorSugerido só é preenchido nos ramos sobrealocado/subalocado de getRecomendacoes.
     const isTrocaTotal = rec.categoriaAcao === 'troca_sugerida';
     const valorPosicaoAtual = inv.quantidade * cotacaoAtual;
-    const valorVenda = isTrocaTotal ? valorPosicaoAtual : Math.min(Math.abs(rec.valorSugerido ?? 0), valorPosicaoAtual);
-    if (valorVenda <= 0) {
+    const valorVendaAlvo = isTrocaTotal ? valorPosicaoAtual : Math.min(Math.abs(rec.valorSugerido ?? 0), valorPosicaoAtual);
+    if (valorVendaAlvo <= 0) {
       throw new BadRequestException('Valor sugerido pra essa recomendação é zero — nada a executar.');
     }
-    const qtdVenda = valorVenda / cotacaoAtual;
+
+    // troca_sugerida vende inv.quantidade inteira, seja lá qual for (mesmo fracionada por uma
+    // compra antiga anterior a este fix — fechar 100% da posição nunca cria fração nova). Venda
+    // PARCIAL (venda_prioritaria/reducao_risco) é arredondada pra baixo pro mesmo tamanho de
+    // unidade da compra (1 ação ou lote de 100) — a B3 nunca negocia fração de ação em nenhum
+    // mercado (bug real corrigido: uma venda saiu pedindo 864,2857142857142 ações).
+    const tamanhoUnidade = permiteFracionario ? TAMANHO_FRACIONARIO : TAMANHO_LOTE;
+    const qtdVenda = isTrocaTotal ? inv.quantidade : arredondarParaLote(valorVendaAlvo / cotacaoAtual, inv.quantidade, tamanhoUnidade);
+    if (qtdVenda <= 0) {
+      throw new BadRequestException('Valor sugerido pra essa recomendação é pequeno demais pra vender 1 ação inteira.');
+    }
+    // Valor real apurado, recalculado a partir da quantidade JÁ arredondada — nunca o valor-alvo
+    // pré-arredondamento, senão o custo do lado da compra (e o ganho realizado abaixo) ficariam
+    // levemente errados por causa da fração descartada no arredondamento da venda.
+    const valorVenda = qtdVenda * cotacaoAtual;
+
+    // Custo das ações vendidas ao precoMedio ANTES da venda (inv ainda não foi mutado aqui) —
+    // sem gravar isso agora, o lucro "reseta" pra zero quando o valor for reinvestido
+    // (comprarOuReforcar usa o valor da venda como novo custo de aquisição da posição de destino).
+    const ganhoRealizadoVenda = valorVenda - qtdVenda * inv.precoMedio;
 
     // Cotação de destino buscada ANTES de abrir a transação interativa — round-trips extras
     // dentro da janela de uma $transaction contam pro timeout dela (P2028, visto em teste real
@@ -141,6 +258,7 @@ export class SimulacaoService {
           preco: cotacaoAtual,
           origem: 'recomendacao',
           motivo: rec.motivoTroca,
+          ganhoRealizado: ganhoRealizadoVenda,
         }),
       ];
 
@@ -334,14 +452,19 @@ export class SimulacaoService {
     return planoDeCompra;
   }
 
-  /** acoesPorSetor só contém tickers já possuídos, então o aporte semanal sempre cai no ramo de
+  /**
+   * acoesPorSetor só contém tickers já possuídos, então o aporte semanal sempre cai no ramo de
    * reforço (existente sempre encontrado); só executarRecomendacao pode bater no ramo de
    * criação, comprando um ticker novo via sugestaoTroca — por isso nomeSugerido é opcional.
    *
-   * Com permiteFracionario=false, a quantidade é arredondada pro múltiplo de 100 mais próximo
-   * pra baixo (ver arredondarParaLote) — o valor que não coube em lote inteiro volta como
-   * `sobra` pro chamador decidir o que fazer (normalmente: creditar em caixaDisponivel). Se nem
-   * 1 lote couber, `transacao` vem null e `sobra` é o valorAporte inteiro (nada foi comprado).
+   * A quantidade é SEMPRE arredondada pra baixo pro múltiplo de `tamanhoUnidade` mais próximo —
+   * 100 (lote-padrão) se `!permiteFracionario`, 1 ação inteira (mercado fracionário) se
+   * `permiteFracionario` (ver arredondarParaLote/TAMANHO_FRACIONARIO). A B3 nunca negocia fração
+   * de ação em nenhum mercado — o toggle só muda a granularidade, nunca "sem arredondar" (bug
+   * real corrigido: uma compra chegou a sair com 864,2857142857142 ações). O valor que não
+   * coube na unidade volta como `sobra` pro chamador decidir o que fazer (normalmente: creditar
+   * em caixaDisponivel). Se nem 1 unidade couber, `transacao` vem null e `sobra` é o valorAporte
+   * inteiro (nada foi comprado).
    */
   private async comprarOuReforcar(
     tx: Prisma.TransactionClient,
@@ -355,17 +478,13 @@ export class SimulacaoService {
     permiteFracionario: boolean,
     nomeSugerido?: string,
   ): Promise<{ transacao: TransacaoSimulacao | null; sobra: number }> {
-    let qtd = valorAporte / cotacao;
-    let sobra = 0;
-
-    if (!permiteFracionario) {
-      const qtdLote = arredondarParaLote(qtd, null);
-      sobra = (qtd - qtdLote) * cotacao;
-      qtd = qtdLote;
-    }
+    const quantidadeBruta = valorAporte / cotacao;
+    const tamanhoUnidade = permiteFracionario ? TAMANHO_FRACIONARIO : TAMANHO_LOTE;
+    const qtd = arredondarParaLote(quantidadeBruta, null, tamanhoUnidade);
+    const sobra = (quantidadeBruta - qtd) * cotacao;
 
     if (qtd <= 0) {
-      return { transacao: null, sobra: sobra || valorAporte };
+      return { transacao: null, sobra: valorAporte };
     }
 
     const existente = await tx.investimento.findFirst({ where: { userId, carteira: 'simulacao', ticker } });
@@ -395,6 +514,59 @@ export class SimulacaoService {
     return { transacao, sobra };
   }
 
+  /**
+   * Venda manual (não gerada por uma recomendação) — usuário decidiu vender por conta própria.
+   * Mesmo mecanismo de executarRecomendacao pra não ficar inconsistente: registra
+   * TransacaoSimulacao com ganhoRealizado apurado ao precoMedio ANTES da venda, e credita o
+   * valor em caixaDisponivel (sem destino de reinvestimento automático — igual reducao_risco).
+   */
+  async venderManual(userId: string, investimentoId: string, quantidade: number, anoMes: string) {
+    const inv = await this.investimentos.garantirDono(userId, investimentoId, 'simulacao');
+    if (quantidade <= 0) {
+      throw new BadRequestException('Quantidade a vender precisa ser maior que zero.');
+    }
+    if (quantidade > inv.quantidade + MARGEM_ZERAR_POSICAO) {
+      throw new BadRequestException(`Você só possui ${inv.quantidade} unidades — não é possível vender ${quantidade}.`);
+    }
+
+    const cotacaoAtual = await this.buscarCotacao(inv.ticker as string, anoMes);
+    if (cotacaoAtual == null) {
+      throw new BadRequestException(`Sem cotação de ${inv.ticker} em ${anoMes} — não é possível executar.`);
+    }
+
+    const valorVenda = quantidade * cotacaoAtual;
+    const ganhoRealizadoVenda = valorVenda - quantidade * inv.precoMedio;
+
+    return this.prisma.$transaction(async (tx) => {
+      const restante = inv.quantidade - quantidade;
+      if (restante <= MARGEM_ZERAR_POSICAO) {
+        await tx.investimento.delete({ where: { id: inv.id } });
+      } else {
+        await tx.investimento.update({ where: { id: inv.id }, data: { quantidade: restante } });
+      }
+
+      const transacao = await this.registrarTransacao(tx, {
+        userId,
+        anoMes,
+        tipo: 'venda',
+        ticker: inv.ticker as string,
+        quantidade,
+        preco: cotacaoAtual,
+        origem: 'manual',
+        motivo: null,
+        ganhoRealizado: ganhoRealizadoVenda,
+      });
+
+      await tx.simulacaoConfig.upsert({
+        where: { userId },
+        update: { caixaDisponivel: { increment: valorVenda } },
+        create: { userId, caixaDisponivel: valorVenda },
+      });
+
+      return transacao;
+    });
+  }
+
   private async registrarTransacao(
     tx: Prisma.TransactionClient,
     dados: {
@@ -406,9 +578,34 @@ export class SimulacaoService {
       preco: number;
       origem: string;
       motivo: string | null;
+      /** Só em vendas — ver comentário do campo no schema. Ausente em compras (fica null). */
+      ganhoRealizado?: number;
     },
   ) {
     return tx.transacaoSimulacao.create({ data: { ...dados, valor: dados.quantidade * dados.preco } });
+  }
+
+  /**
+   * Soma de todo ganho realizado (vendas com lucro/prejuízo já apurado, ver ganhoRealizado)
+   * desde o último "Reiniciar simulação" — reiniciar apaga TransacaoSimulacao, então a soma
+   * sempre reflete só o ciclo atual, sem precisar de um contador separado pra zerar.
+   */
+  async getGanhoRealizado(userId: string): Promise<number> {
+    const resultado = await this.prisma.transacaoSimulacao.aggregate({
+      where: { userId, tipo: 'venda' },
+      _sum: { ganhoRealizado: true },
+    });
+    return resultado._sum.ganhoRealizado ?? 0;
+  }
+
+  /** Log completo de tudo que já aconteceu na simulação (mais recente primeiro) — pra o usuário
+   * replicar manualmente na carteira real. Sem filtro de anoMes de propósito: o ponto é dar uma
+   * visão de tudo que já foi feito desde o último "Reiniciar simulação", não só o mês corrente. */
+  async listarTransacoes(userId: string): Promise<TransacaoSimulacao[]> {
+    return this.prisma.transacaoSimulacao.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+    });
   }
 
   private async buscarCotacao(ticker: string, anoMes: string): Promise<number | null> {

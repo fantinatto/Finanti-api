@@ -113,4 +113,8 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
   get historicoCarteira() {
     return this.prisma.historicoCarteira;
   }
+
+  get operacaoFiscal() {
+    return this.prisma.operacaoFiscal;
+  }
 }

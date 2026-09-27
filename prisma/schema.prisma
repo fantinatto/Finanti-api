@@ -28,6 +28,7 @@ model User {
   transacoesSimulacao TransacaoSimulacao[]
   simulacaoConfig     SimulacaoConfig?
   historicoCarteira   HistoricoCarteira[]
+  operacoesFiscais    OperacaoFiscal[]
 
   @@map("users")
 }
@@ -118,6 +119,21 @@ model IndicadorMensal {
   /// scoring/liquidez.ts). Ausente em ~24% do universo mesmo pra blue chips líquidas (bug de
   /// cobertura da fonte, confirmado com VIVT4) — null aqui NUNCA deve virar penalização máxima.
   liquidezMediaDiaria Float?
+
+  /// Giro de Ativos (Status Invest `giroativos`) — 99,5% de cobertura confirmada ao vivo em
+  /// 2026-09-24. Guardado bruto, FORA de INDICATOR_CONFIG de propósito: ainda não entra na
+  /// normalização/score, é uma decisão de fórmula separada (ver discussão de multicolinearidade).
+  giroAtivos Float?
+
+  /// EV/EBIT (Status Invest `ev_ebit`) — NÃO é EV/EBITDA (denominador diferente), 96,9% de
+  /// cobertura confirmada ao vivo em 2026-09-24. Mesmo status de giroAtivos: guardado bruto,
+  /// ainda fora do score.
+  evEbit Float?
+
+  /// Dívida Líquida/EBIT nativo da Status Invest (`dividaliquidaebit`) — métrica DIFERENTE de
+  /// dividaLiquidaEbitda (que só vem do bolsai, denominador EBITDA). Guardado à parte de
+  /// propósito pra não conflitar as duas — ver comentário em ingestion.service.ts:mapearAcao.
+  dividaLiquidaEbit Float?
 
   /// true quando faltou algum dos campos mínimos (pl, pvp, lpa, vpa, roe, roa, pEbit)
   /// mesmo depois de tentar completar com a API de fallback.
@@ -330,7 +346,13 @@ model TransacaoSimulacao {
   preco      Float // IndicadorMensal.precoFechamento no anoMes, usado como preço de execução
   valor      Float // quantidade * preco
 
-  /// "recomendacao" | "aporte_semanal" | "reinicio"
+  /// Só preenchido em vendas (tipo="venda"): valor apurado − custo (quantidade × precoMedio da
+  /// posição no momento da venda). Sem isso o lucro de uma venda "reseta" pra zero quando o
+  /// dinheiro é reinvestido — comprarOuReforcar usa o valor da venda como novo custo de aquisição
+  /// da posição de destino, sem carregar o ganho embutido. Null em compras (não se aplica).
+  ganhoRealizado Float?
+
+  /// "recomendacao" | "aporte_semanal" | "reinicio" | "caixa" | "manual"
   origem String
   motivo String?
 
@@ -390,4 +412,41 @@ model HistoricoCarteira {
 
   @@unique([userId, carteira, anoMes])
   @@map("historico_carteira")
+}
+
+/// Livro fiscal de operações REAIS (compra/venda) — módulo independente de Investimento (que só
+/// guarda a posição atual consolidada, sem histórico de operações nem data). Cadastro manual
+/// nesta 1ª versão: não é populado automaticamente pelas telas de Investimentos/Simulação. Base
+/// pra apuração mensal de ganho/prejuízo por bucket fiscal (comum/day trade/FII), sem cálculo de
+/// DARF nem declaração anual ainda (fora de escopo desta 1ª versão).
+model OperacaoFiscal {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  data   DateTime
+  ticker String
+
+  /// "acao" | "fii" — junto com tradeType define o bucket fiscal (ver fiscal.service.ts).
+  assetType String
+
+  /// "compra" | "venda"
+  tipo String
+
+  /// "swing" | "day_trade" — informado manualmente pelo usuário nesta 1ª versão (sem detecção
+  /// automática de compra+venda no mesmo dia).
+  tradeType String @default("swing")
+
+  quantidade    Float
+  precoUnitario Float
+
+  /// Corretagem + emolumentos + outros custos da operação — soma ao custo médio (compra) ou
+  /// reduz o resultado apurado (venda). Opcional, default 0.
+  custos Float @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, ticker, data])
+  @@map("operacoes_fiscais")
 }

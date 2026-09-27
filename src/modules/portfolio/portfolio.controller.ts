@@ -8,8 +8,10 @@ import { InvestimentoService } from './services/investimento.service';
 import type { TipoCarteira } from './services/investimento.service';
 import { SimulacaoService } from './services/simulacao.service';
 import { HistoricoCarteiraService } from './services/historico-carteira.service';
+import { FiscalService } from '../fiscal/services/fiscal.service';
 import { UpsertPortfolioConfigDto } from './dto/upsert-portfolio-config.dto';
 import { UpsertInvestimentoDto } from './dto/upsert-investimento.dto';
+import { VenderInvestimentoDto } from './dto/vender-investimento.dto';
 import { UpsertSimulacaoConfigDto } from './dto/upsert-simulacao-config.dto';
 import { BASES_REGRA_PADRAO, CONTRATO_DI_FIXO, TAXA_DI_FIXA } from './rebalancing.config';
 
@@ -23,6 +25,7 @@ export class PortfolioController {
     private readonly investimentos: InvestimentoService,
     private readonly simulacao: SimulacaoService,
     private readonly historicoCarteira: HistoricoCarteiraService,
+    private readonly fiscal: FiscalService,
   ) {}
 
   @Get('config')
@@ -63,7 +66,26 @@ export class PortfolioController {
 
   @Post('investimentos')
   async criarInvestimento(@Req() req: Request, @Body() dto: UpsertInvestimentoDto) {
-    return this.investimentos.criar(req['user'].sub, dto);
+    const userId = req['user'].sub;
+    const investimento = await this.investimentos.criar(userId, dto);
+
+    // Espelha no livro fiscal só se o usuário marcou explicitamente (ver comentário do campo no
+    // DTO) — "Adicionar" também serve pra cadastrar uma posição antiga já possuída, então nunca
+    // registra por padrão sem confirmação.
+    if (dto.registrarFiscal && dto.tipo !== 'renda_fixa' && dto.ticker) {
+      await this.fiscal.criar(userId, {
+        data: dto.dataOperacao ?? new Date().toISOString().slice(0, 10),
+        ticker: dto.ticker,
+        assetType: dto.tipo,
+        tipo: 'compra',
+        tradeType: 'swing',
+        quantidade: dto.quantidade,
+        precoUnitario: dto.precoMedio,
+        custos: dto.custosFiscais ?? 0,
+      });
+    }
+
+    return investimento;
   }
 
   @Put('investimentos/:id')
@@ -77,6 +99,32 @@ export class PortfolioController {
     return { ok: true };
   }
 
+  @Post('investimentos/:id/vender')
+  async venderInvestimento(@Req() req: Request, @Param('id') id: string, @Body() dto: VenderInvestimentoDto) {
+    const userId = req['user'].sub;
+    // Buscado ANTES de vender() — vender() pode deletar a linha (posição zerada), e o ticker/tipo
+    // fazem falta pra montar a OperacaoFiscal depois.
+    const antes = await this.investimentos.garantirDono(userId, id, 'real');
+    const resultado = await this.investimentos.vender(userId, id, dto.quantidade);
+
+    // Diferente da criação, uma venda nunca é ambígua (é sempre uma operação de hoje) — registra
+    // no fiscal automaticamente sempre que vier um preço, sem precisar de confirmação extra.
+    if (dto.precoVenda != null && antes.tipo !== 'renda_fixa' && antes.ticker) {
+      await this.fiscal.criar(userId, {
+        data: new Date().toISOString().slice(0, 10),
+        ticker: antes.ticker,
+        assetType: antes.tipo as 'acao' | 'fii',
+        tipo: 'venda',
+        tradeType: 'swing',
+        quantidade: dto.quantidade,
+        precoUnitario: dto.precoVenda,
+        custos: dto.custosFiscais ?? 0,
+      });
+    }
+
+    return resultado;
+  }
+
   @Get('investimentos/ganhos')
   async ganhosInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
     const userId = req['user'].sub;
@@ -87,6 +135,26 @@ export class PortfolioController {
   @Get('investimentos/recomendacoes')
   async recomendacoesInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
     return this.investimentos.getRecomendacoes(req['user'].sub, anoMes);
+  }
+
+  @Get('investimentos/balanceamento')
+  async balanceamentoInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getBalanceamentoPorSetor(req['user'].sub, anoMes);
+  }
+
+  @Get('investimentos/saude')
+  async saudeInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getSaudeCarteira(req['user'].sub, anoMes);
+  }
+
+  @Get('investimentos/impacto')
+  async impactoInvestimentos(
+    @Req() req: Request,
+    @Query('anoMes') anoMes: string,
+    @Query('ticker') ticker: string,
+    @Query('valor') valor: string,
+  ) {
+    return this.investimentos.simularImpactoCompra(req['user'].sub, anoMes, ticker.toUpperCase(), Number(valor));
   }
 
   @Get('historico')
@@ -110,25 +178,45 @@ export class PortfolioController {
     return { ok: true };
   }
 
+  @Get('simulacao/ganho-realizado')
+  async getGanhoRealizado(@Req() req: Request) {
+    return { ganhoRealizado: await this.simulacao.getGanhoRealizado(req['user'].sub) };
+  }
+
+  @Get('simulacao/transacoes')
+  async listarTransacoesSimulacao(@Req() req: Request) {
+    return this.simulacao.listarTransacoes(req['user'].sub);
+  }
+
   @Get('simulacao/investimentos')
   async listarInvestimentosSimulacao(@Req() req: Request) {
     return this.investimentos.listar(req['user'].sub, 'simulacao');
   }
 
   @Post('simulacao/investimentos')
-  async criarInvestimentoSimulacao(@Req() req: Request, @Body() dto: UpsertInvestimentoDto) {
-    return this.investimentos.criar(req['user'].sub, dto, 'simulacao');
+  async criarInvestimentoSimulacao(@Req() req: Request, @Body() dto: UpsertInvestimentoDto, @Query('anoMes') anoMes?: string) {
+    return this.simulacao.criar(req['user'].sub, dto, anoMes);
   }
 
   @Put('simulacao/investimentos/:id')
   async atualizarInvestimentoSimulacao(@Req() req: Request, @Param('id') id: string, @Body() dto: UpsertInvestimentoDto) {
-    return this.investimentos.atualizar(req['user'].sub, id, dto, 'simulacao');
+    return this.simulacao.atualizar(req['user'].sub, id, dto);
   }
 
   @Delete('simulacao/investimentos/:id')
   async removerInvestimentoSimulacao(@Req() req: Request, @Param('id') id: string) {
     await this.investimentos.remover(req['user'].sub, id, 'simulacao');
     return { ok: true };
+  }
+
+  @Post('simulacao/investimentos/:id/vender')
+  async venderInvestimentoSimulacao(
+    @Req() req: Request,
+    @Param('id') id: string,
+    @Body() dto: VenderInvestimentoDto,
+    @Query('anoMes') anoMes: string,
+  ) {
+    return this.simulacao.venderManual(req['user'].sub, id, dto.quantidade, anoMes);
   }
 
   @Get('simulacao/investimentos/ganhos')
@@ -141,6 +229,26 @@ export class PortfolioController {
   @Get('simulacao/investimentos/recomendacoes')
   async recomendacoesInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
     return this.investimentos.getRecomendacoes(req['user'].sub, anoMes, 'simulacao');
+  }
+
+  @Get('simulacao/investimentos/balanceamento')
+  async balanceamentoInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getBalanceamentoPorSetor(req['user'].sub, anoMes, 'simulacao');
+  }
+
+  @Get('simulacao/investimentos/saude')
+  async saudeInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getSaudeCarteira(req['user'].sub, anoMes, 'simulacao');
+  }
+
+  @Get('simulacao/investimentos/impacto')
+  async impactoInvestimentosSimulacao(
+    @Req() req: Request,
+    @Query('anoMes') anoMes: string,
+    @Query('ticker') ticker: string,
+    @Query('valor') valor: string,
+  ) {
+    return this.investimentos.simularImpactoCompra(req['user'].sub, anoMes, ticker.toUpperCase(), Number(valor), 'simulacao');
   }
 
   @Post('simulacao/investimentos/:id/executar-recomendacao')

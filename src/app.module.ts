@@ -7,6 +7,7 @@ import { AuthModule } from './modules/auth/auth.module';
 import { UsersModule } from './modules/users/users.module';
 import { MarketDataModule } from './modules/market-data/market-data.module';
 import { PortfolioModule } from './modules/portfolio/portfolio.module';
+import { FiscalModule } from './modules/fiscal/fiscal.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { PortfolioModule } from './modules/portfolio/portfolio.module';
     UsersModule,
     MarketDataModule,
     PortfolioModule,
+    FiscalModule,
   ],
   controllers: [AppController],
   providers: [AppService],

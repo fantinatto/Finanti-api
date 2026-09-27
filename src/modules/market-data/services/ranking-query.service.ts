@@ -19,6 +19,32 @@ export interface LinhaHibrida {
   scoreFinalDelta: number | null;
 }
 
+/**
+ * Abaixo disso, "o campeão do segmento" é só quem não tem concorrência direta e tende a bater
+ * no teto de normalização por falta de comparáveis (razão contra a média de si mesmo = 1,0 em
+ * todo indicador) — não por mérito. Checado em 2026-09: 42 dos 58 segmentos reais da B3 têm
+ * menos de 3 ações com score, e todo segmento com N=1 produz o mesmo score fixo
+ * (scoreQualidade=1, scoreRisco=3, scorePreco=1, scoreFinal=1,8) pra qualquer empresa que caia
+ * nele. Usado tanto pelo Híbrido (redireciona peso pro setor) quanto pelo fallback do modo
+ * "segmento" puro (getScoresSegmentoComFallback) — mesmo limiar, mesma garantia nos dois lugares.
+ */
+export const QTD_MINIMA_SEGMENTO = 3;
+
+export interface ScoreComOrigem {
+  scoreQualidade: number | null;
+  qualidadeDelta: number | null;
+  scoreRisco: number | null;
+  riscoDelta: number | null;
+  riscoComposto: number | null;
+  scorePreco: number | null;
+  precoDelta: number | null;
+  scoreFinal: number | null;
+  scoreFinalDelta: number | null;
+  /** 'setor_fallback' quando o segmento da ação tem menos de QTD_MINIMA_SEGMENTO comparáveis —
+   * os campos de score acima já vêm do tier 'setor' nesse caso, não do 'segmento' bruto. */
+  origemScore: 'segmento' | 'setor_fallback';
+}
+
 @Injectable()
 export class RankingQueryService {
   constructor(private readonly prisma: PrismaService) {}
@@ -61,8 +87,29 @@ export class RankingQueryService {
    * nomeGrupo omitido/vazio = "todos os grupos" — cada ação pertence a só um nomeGrupo
    * por tipoGrupo (seu próprio setor ou segmento), então tirar o filtro não duplica
    * linha nenhuma, só junta o ranking inteiro numa lista só.
+   *
+   * tipoGrupo='segmento' passa pelo fallback de amostra pequena (ver getScoresSegmentoComFallback)
+   * — ações em segmento com menos de QTD_MINIMA_SEGMENTO comparáveis mostram o score do SETOR
+   * em vez do valor fixo sem sentido (`origemScore: 'setor_fallback'` sinaliza isso pro front).
    */
   async getRanking(tipoGrupo: string, nomeGrupo: string | undefined, anoMes: string) {
+    if (tipoGrupo === 'segmento') {
+      const scoresPorTicker = await this.getScoresSegmentoComFallback(anoMes);
+      const acoes = await this.prisma.acao.findMany({
+        where: nomeGrupo ? { segmento: nomeGrupo } : { segmento: { not: null } },
+        select: { ticker: true, nome: true, setor: true, segmento: true },
+      });
+
+      return acoes
+        .map((a) => {
+          const s = scoresPorTicker.get(a.ticker);
+          if (!s || s.scoreFinal == null) return null;
+          return { ticker: a.ticker, nome: a.nome, setor: a.setor, segmento: a.segmento, ...s };
+        })
+        .filter((r): r is NonNullable<typeof r> => r !== null)
+        .sort((a, b) => (b.scoreFinal ?? 0) - (a.scoreFinal ?? 0));
+    }
+
     // scoreFinal: not null — Postgres ordena NULL antes de qualquer valor em DESC,
     // então sem esse filtro ações sem score calculado apareciam em 1º lugar.
     const where: { tipoGrupo: string; nomeGrupo?: string; anoMes: string; scoreFinal: { not: null } } = {
@@ -92,7 +139,52 @@ export class RankingQueryService {
       precoDelta: s.precoDelta,
       scoreFinal: s.scoreFinal,
       scoreFinalDelta: s.scoreFinalDelta,
+      origemScore: null as 'segmento' | 'setor_fallback' | null,
     }));
+  }
+
+  /**
+   * Score de cada ticker no tier 'segmento', com fallback pro tier 'setor' quando o segmento
+   * tem menos de QTD_MINIMA_SEGMENTO comparáveis (ver o comentário na constante). Base tanto do
+   * modo "segmento" puro em getRanking() quanto de tipoRankingRecomendacao='segmento' em
+   * InvestimentoService — mesmo critério de confiabilidade usado no Híbrido, só que aqui
+   * substituindo o score inteiro em vez de só redistribuir peso (não tem "setor" E "segmento"
+   * pra misturar fora do Híbrido, só um dos dois pode vencer).
+   */
+  async getScoresSegmentoComFallback(anoMes: string): Promise<Map<string, ScoreComOrigem>> {
+    const [segmentoRows, setorRows] = await Promise.all([
+      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'segmento', anoMes } }),
+      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'setor', anoMes } }),
+    ]);
+
+    const setorPorTicker = new Map(setorRows.map((r) => [r.ticker, r]));
+    const qtdPorSegmento = new Map<string, number>();
+    for (const r of segmentoRows) {
+      if (r.scoreFinal == null) continue; // não conta pra amostra quem nem teve score calculado
+      qtdPorSegmento.set(r.nomeGrupo, (qtdPorSegmento.get(r.nomeGrupo) ?? 0) + 1);
+    }
+
+    const resultado = new Map<string, ScoreComOrigem>();
+    for (const segRow of segmentoRows) {
+      const confiavel = (qtdPorSegmento.get(segRow.nomeGrupo) ?? 0) >= QTD_MINIMA_SEGMENTO;
+      // Sem score de setor disponível pro ticker (raro), mantém o segmento como último recurso
+      // em vez de descartar a ação inteira do ranking.
+      const fonte = confiavel ? segRow : (setorPorTicker.get(segRow.ticker) ?? segRow);
+
+      resultado.set(segRow.ticker, {
+        scoreQualidade: fonte.scoreQualidade,
+        qualidadeDelta: fonte.qualidadeDelta,
+        scoreRisco: fonte.scoreRisco,
+        riscoDelta: fonte.riscoDelta,
+        riscoComposto: fonte.riscoComposto,
+        scorePreco: fonte.scorePreco,
+        precoDelta: fonte.precoDelta,
+        scoreFinal: fonte.scoreFinal,
+        scoreFinalDelta: fonte.scoreFinalDelta,
+        origemScore: confiavel ? 'segmento' : 'setor_fallback',
+      });
+    }
+    return resultado;
   }
 
   /**
@@ -119,7 +211,6 @@ export class RankingQueryService {
     const PESO_SETOR = 0.6;
     const PESO_SEGMENTO = 0.3;
     const PESO_GERAL = 0.1;
-    const QTD_MINIMA_SEGMENTO = 3;
 
     const [setorRows, segmentoRows, geralRows] = await Promise.all([
       this.prisma.scoreNormalizado.findMany({
@@ -208,6 +299,60 @@ export class RankingQueryService {
       if (r.setor && r.segmento) mapa[r.segmento] = r.setor;
     }
     return mapa;
+  }
+
+  /**
+   * Search-help pro campo de ticker do formulário de "Comprar" (Investimentos/Simulação) —
+   * autocomplete por ticker OU nome, devolvendo o nome já cadastrado e o último preço de
+   * fechamento conhecido (não é cotação em tempo real, é o mesmo dado usado em calcularGanhos).
+   * Só cobre `tipo==='acao'` — FIIs/renda fixa não têm ingestão de fundamentos (ver Acao).
+   */
+  async buscarTickers(
+    query: string,
+  ): Promise<{ ticker: string; nome: string; precoFechamento: number | null; anoMes: string | null }[]> {
+    const termo = query.trim();
+    if (termo.length < 1) return [];
+
+    const acoes = await this.prisma.acao.findMany({
+      where: {
+        OR: [
+          { ticker: { contains: termo, mode: 'insensitive' } },
+          { nome: { contains: termo, mode: 'insensitive' } },
+        ],
+      },
+      select: { ticker: true, nome: true },
+      take: 15,
+    });
+    if (acoes.length === 0) return [];
+
+    // Ticker que COMEÇA com o termo aparece primeiro (ex: "PETR" → PETR3/PETR4 antes de um nome
+    // que só contém "petr" no meio) — mais útil num autocomplete do que ordem alfabética simples.
+    const termoUpper = termo.toUpperCase();
+    acoes.sort((a, b) => {
+      const prioridadeA = a.ticker.startsWith(termoUpper) ? 0 : 1;
+      const prioridadeB = b.ticker.startsWith(termoUpper) ? 0 : 1;
+      return prioridadeA !== prioridadeB ? prioridadeA - prioridadeB : a.ticker.localeCompare(b.ticker);
+    });
+
+    const tickers = acoes.map((a) => a.ticker);
+    const indicadores = await this.prisma.indicadorMensal.findMany({
+      where: { ticker: { in: tickers } },
+      select: { ticker: true, anoMes: true, precoFechamento: true },
+      orderBy: { anoMes: 'desc' },
+    });
+    const maisRecentePorTicker = new Map<string, { anoMes: string; precoFechamento: number | null }>();
+    for (const ind of indicadores) {
+      if (!maisRecentePorTicker.has(ind.ticker)) {
+        maisRecentePorTicker.set(ind.ticker, { anoMes: ind.anoMes, precoFechamento: ind.precoFechamento });
+      }
+    }
+
+    return acoes.map((a) => ({
+      ticker: a.ticker,
+      nome: a.nome,
+      precoFechamento: maisRecentePorTicker.get(a.ticker)?.precoFechamento ?? null,
+      anoMes: maisRecentePorTicker.get(a.ticker)?.anoMes ?? null,
+    }));
   }
 
   /**

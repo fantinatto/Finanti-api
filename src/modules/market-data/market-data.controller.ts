@@ -58,6 +58,11 @@ export class MarketDataController {
     return this.brapi.previewTicker(ticker.toUpperCase());
   }
 
+  @Get('tickers')
+  async buscarTickers(@Query('q') q: string) {
+    return this.ranking.buscarTickers(q ?? '');
+  }
+
   @Get('ranking')
   async getRanking(
     @Query('tipoGrupo') tipoGrupo: string,

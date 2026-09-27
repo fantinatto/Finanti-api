@@ -27,6 +27,14 @@ interface AcaoEnriquecida {
   precoFechamento: number | null;
   /** R$/dia — usado só pro fator de penalização de liquidez em calcularScores, ver scoring/liquidez.ts. */
   liquidezMediaDiaria: number | null;
+  /** Guardados brutos, FORA de IndicadoresMap de propósito — disponíveis na Status Invest
+   * (99,5%/96,9% de cobertura, confirmado ao vivo em 2026-09-24) mas ainda não entram na
+   * normalização/score (INDICATOR_CONFIG). Incorporá-los ao score é uma decisão de fórmula
+   * separada (pesos, direção, clamps) — por ora só persistidos pra já existir histórico quando
+   * essa decisão for tomada. */
+  giroAtivos: number | null;
+  evEbit: number | null;
+  dividaLiquidaEbit: number | null;
   indicadores: IndicadoresMap;
 }
 
@@ -157,6 +165,9 @@ export class IngestionService {
       passivoADescoberto,
       precoFechamento: acao.precoFechamento,
       liquidezMediaDiaria: acao.liquidezMediaDiaria,
+      giroAtivos: acao.giroAtivos,
+      evEbit: acao.evEbit,
+      dividaLiquidaEbit: acao.dividaLiquidaEbit,
     };
     await this.prisma.indicadorMensal.upsert({
       where: { ticker_anoMes: { ticker: acao.ticker, anoMes } },
@@ -269,6 +280,9 @@ export class IngestionService {
       segmento: item.segmentname || null,
       precoFechamento: item.price ?? null,
       liquidezMediaDiaria: item.liquidezmediadiaria ?? null,
+      giroAtivos: item.giroativos ?? null,
+      evEbit: item.ev_ebit ?? null,
+      dividaLiquidaEbit: item.dividaliquidaebit ?? null,
       indicadores,
     };
   }
