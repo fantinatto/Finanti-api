@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { PortfolioState } from '../domain/portfolio-state';
+import { availableToInvest, PortfolioState } from '../domain/portfolio-state';
 import { PortfolioBalanceState, PortfolioEvaluation, SearchHealthAxis } from '../domain/portfolio-evaluation';
 
 const LIMIAR_COVERAGE_AVISO = 0.8;
@@ -71,15 +71,38 @@ export class PortfolioEvaluatorService {
       registrarAvisoSeBaixo('Preço Δ', search.price, 'precoDelta');
     }
 
+    // Visão LEGADA (denominador vivo) — bit-a-bit igual a getBalanceamentoPorSetor hoje. Só
+    // consumida por B1/wrappers; nunca pelo comparador.
     const setoresOrdenados = [...state.sectors].sort((a, b) => Math.abs(b.diferenca) - Math.abs(a.diferenca));
-    const overweightSectors = setoresOrdenados.filter((s) => s.status === 'sobrealocado');
-    const underweightSectors = setoresOrdenados.filter((s) => s.status === 'subalocado');
+
+    // Visão ESTÁVEL (searchAllocationBase) — usada pelos agregados abaixo (sectorsOutsideBand em
+    // diante), consumidos pelo comparador/motor de busca (ver invariante 1, plano da Fase C).
+    // Lida direto de `state.stableSectors` (calculado uma vez no snapshot/StateTransition via
+    // `computeSectorAllocation` — ver "Estouro Dinâmico") em vez de recalcular aqui — antes desta
+    // extração, o Evaluator recomputava essa mesma conta inline, independente do que o
+    // MoveGenerator usava (a raiz do "achado" do Estouro Dinâmico).
+    const base = state.searchAllocationBase;
+    const stableSetores = [...state.stableSectors].sort((a, b) => Math.abs(b.diferenca) - Math.abs(a.diferenca));
+
+    const overweightSectors = stableSetores.filter((s) => s.status === 'sobrealocado');
+    const underweightSectors = stableSetores.filter((s) => s.status === 'subalocado');
+    const unallocatedCapital = availableToInvest(state.capital);
+
+    const worstSegmentConcentration = state.segmentConcentration.reduce(
+      (max, s) => (s.concentrado ? Math.max(max, s.maxSegmentShare) : max),
+      0,
+    );
+
     const balance: PortfolioBalanceState = {
       setores: setoresOrdenados,
+      stableSetores,
+      unallocatedCapital,
+      unallocatedCapitalPercent: base > 0 ? (unallocatedCapital / base) * 100 : 0,
       sectorsOutsideBand: overweightSectors.length + underweightSectors.length,
-      totalSectorDeviation: state.sectors.reduce((acc, s) => acc + Math.abs(s.diferenca), 0),
+      totalSectorDeviation: stableSetores.reduce((acc, s) => acc + Math.abs(s.diferenca), 0),
       overweightSectors,
       underweightSectors,
+      worstSegmentConcentration,
       positionConcentrationViolations: [],
       hardViolations: [],
     };

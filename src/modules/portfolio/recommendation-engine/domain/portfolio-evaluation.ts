@@ -29,11 +29,34 @@ export interface PortfolioHealthState {
 }
 
 export interface PortfolioBalanceState {
+  /** Bit-a-bit igual a `getBalanceamentoPorSetor` hoje (denominador VIVO — soma das posições
+   * atuais). Consumido por B1/wrappers legados. NÃO usar isso pro comparador (Fase B2+) — ver
+   * `stableSetores`/os agregados abaixo. */
   setores: BalanceamentoSetor[];
+  /**
+   * Visão paralela usando `PortfolioState.searchAllocationBase` (estável dentro de uma mesma
+   * linha de busca) em vez do denominador vivo — sem isso, vender uma posição sem recompra
+   * imediata encolheria `valorTotalAcoes` e faria TODOS os outros setores parecerem mais
+   * alocados só porque o denominador caiu, não porque mudou algo neles. `sectorsOutsideBand`/
+   * `totalSectorDeviation`/`overweightSectors`/`underweightSectors` abaixo vêm DAQUI, não de
+   * `setores` — são agregados novos (não existiam no `BalanceamentoSetor[]` legado, então
+   * redefini-los pra usar a base estável não quebra nenhuma validação da Fase A.
+   */
+  stableSetores: BalanceamentoSetor[];
+  /** Caixa/proceeds ainda não realocados — não deve ser tratado como estado terminal perfeito só
+   * porque "resolveu" um setor por venda (ver invariante 1). */
+  unallocatedCapital: number;
+  unallocatedCapitalPercent: number;
   sectorsOutsideBand: number;
   totalSectorDeviation: number;
   overweightSectors: BalanceamentoSetor[];
   underweightSectors: BalanceamentoSetor[];
+  /** Maior `maxSegmentShare` entre os setores com `concentrado=true` (ver
+   * `PortfolioState.segmentConcentration`) — 0 se nenhum setor concentrado. Medida GLOBAL (como
+   * `totalSectorDeviation`), não por setor: comparar dois candidatos que tocam setores diferentes
+   * ainda faz sentido perguntando "qual deixa o PIOR problema de concentração da carteira
+   * inteira melhor" (Fase C.1). */
+  worstSegmentConcentration: number;
   /** Sempre vazio nesta fase — não existe limite de concentração no schema ainda (ver plano,
    * Fase E). Não inventar limite; documentado como gap. */
   positionConcentrationViolations: never[];

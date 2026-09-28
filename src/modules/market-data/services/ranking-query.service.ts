@@ -153,8 +153,8 @@ export class RankingQueryService {
    */
   async getScoresSegmentoComFallback(anoMes: string): Promise<Map<string, ScoreComOrigem>> {
     const [segmentoRows, setorRows] = await Promise.all([
-      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'segmento', anoMes } }),
-      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'setor', anoMes } }),
+      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'segmento', anoMes }, orderBy: { ticker: 'asc' } }),
+      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'setor', anoMes }, orderBy: { ticker: 'asc' } }),
     ]);
 
     const setorPorTicker = new Map(setorRows.map((r) => [r.ticker, r]));
@@ -216,9 +216,10 @@ export class RankingQueryService {
       this.prisma.scoreNormalizado.findMany({
         where: { tipoGrupo: 'setor', anoMes, scoreFinal: { not: null } },
         include: { acao: { select: { nome: true, setor: true, segmento: true } } },
+        orderBy: { ticker: 'asc' },
       }),
-      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'segmento', anoMes, scoreFinal: { not: null } } }),
-      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'geral', anoMes, scoreFinal: { not: null } } }),
+      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'segmento', anoMes, scoreFinal: { not: null } }, orderBy: { ticker: 'asc' } }),
+      this.prisma.scoreNormalizado.findMany({ where: { tipoGrupo: 'geral', anoMes, scoreFinal: { not: null } }, orderBy: { ticker: 'asc' } }),
     ]);
 
     const segmentoPorTicker = new Map(segmentoRows.map((r) => [r.ticker, r]));

@@ -253,6 +253,17 @@ model PortfolioConfig {
   percentualAcoes     Float // dentro da renda variável (percentualFiis + percentualAcoes = 100)
   percentualEstouro   Float // gatilho de rebalanceamento (só armazenado — motor de alerta é trabalho futuro)
 
+  /// "FIXED" | "DYNAMIC_PRICE" — motor novo (recommendation-engine): banda de tolerância fixa
+  /// (±percentualEstouro) ou dinâmica por atratividade de Preço do setor. Produção sempre "FIXED"
+  /// nesta rodada — modo dinâmico só pra comparação via scripts standalone.
+  rebalanceToleranceMode  String  @default("FIXED")
+  /// pp de ajuste máximo (pra mais ou pra menos) que a atratividade de Preço pode aplicar sobre
+  /// percentualEstouro em modo DYNAMIC_PRICE.
+  dynamicMaxAdjustment    Float   @default(2)
+  /// guardrail: neutraliza a expansão positiva da banda quando Qualidade/Risco do setor são
+  /// relativamente fracos, mesmo com Preço atrativo (ver DynamicAllocationBandService).
+  dynamicGuardrailEnabled Boolean @default(true)
+
   /// "base80" | "base100" | "base110" | "base120" | "base_di" | null (alocação 100% manual)
   regraSelecionada String?
   /// permite uma base fora dos presets (80/100/110/120) quando regraSelecionada indicar uma regra genérica
@@ -352,9 +363,16 @@ model TransacaoSimulacao {
   /// da posição de destino, sem carregar o ganho embutido. Null em compras (não se aplica).
   ganhoRealizado Float?
 
-  /// "recomendacao" | "aporte_semanal" | "reinicio" | "caixa" | "manual"
+  /// "recomendacao" | "aporte_semanal" | "reinicio" | "caixa" | "manual" | "motor" (Next Best
+  /// Action, ver idempotencyKey)
   origem String
   motivo String?
+
+  /// sha256(userId :: snapshotHash :: actionFingerprint) — só preenchido em execuções vindas do
+  /// motor novo (Next Best Action). Protege contra duplo clique/retry: a MESMA confirmação nunca
+  /// persiste 2 transações (ver RecommendationEngineService.executeNextBestAction). Null pras
+  /// origens antigas (manual/recomendacao B1/aporte/caixa/reinicio), que não têm esse conceito.
+  idempotencyKey String? @unique
 
   createdAt DateTime @default(now())
 

@@ -9,10 +9,12 @@ import type { TipoCarteira } from './services/investimento.service';
 import { SimulacaoService } from './services/simulacao.service';
 import { HistoricoCarteiraService } from './services/historico-carteira.service';
 import { FiscalService } from '../fiscal/services/fiscal.service';
+import { RecommendationEngineService } from './recommendation-engine/recommendation-engine.service';
 import { UpsertPortfolioConfigDto } from './dto/upsert-portfolio-config.dto';
 import { UpsertInvestimentoDto } from './dto/upsert-investimento.dto';
 import { VenderInvestimentoDto } from './dto/vender-investimento.dto';
 import { UpsertSimulacaoConfigDto } from './dto/upsert-simulacao-config.dto';
+import { ExecutarNextBestActionDto } from './dto/executar-next-best-action.dto';
 import { BASES_REGRA_PADRAO, CONTRATO_DI_FIXO, TAXA_DI_FIXA } from './rebalancing.config';
 
 @Controller('portfolio')
@@ -26,6 +28,7 @@ export class PortfolioController {
     private readonly simulacao: SimulacaoService,
     private readonly historicoCarteira: HistoricoCarteiraService,
     private readonly fiscal: FiscalService,
+    private readonly recommendationEngine: RecommendationEngineService,
   ) {}
 
   @Get('config')
@@ -229,6 +232,26 @@ export class PortfolioController {
   @Get('simulacao/investimentos/recomendacoes')
   async recomendacoesInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
     return this.investimentos.getRecomendacoes(req['user'].sub, anoMes, 'simulacao');
+  }
+
+  /**
+   * Preview do motor novo (Search Engine depth=3 + Decision Trace) — só leitura, nenhuma
+   * mutação, deliberadamente PARALELO ao endpoint legado acima. Não substitui/chama
+   * `getRecomendacoes`/`generateB1` nem é chamado por eles.
+   */
+  @Get('recommendation-engine/preview')
+  async previewRecommendationEngine(@Req() req: Request, @Query('anoMes') anoMes: string, @Query('carteira') carteira?: TipoCarteira) {
+    return this.recommendationEngine.getPreview(req['user'].sub, anoMes, carteira ?? 'real');
+  }
+
+  /**
+   * Executa de verdade a Next Best Action do Preview (ver plano "Next Best Action / Receding
+   * Horizon") — SEMPRE recalcula o Search aqui dentro antes de executar; `409` (`
+   * NEXT_BEST_ACTION_CHANGED`) se a carteira mudou desde o Preview que o usuário confirmou.
+   */
+  @Post('simulacao/next-best-action/executar')
+  async executarNextBestAction(@Req() req: Request, @Body() dto: ExecutarNextBestActionDto, @Query('anoMes') anoMes: string, @Query('carteira') carteira?: TipoCarteira) {
+    return this.recommendationEngine.executeNextBestAction(req['user'].sub, anoMes, carteira ?? 'simulacao', dto.expectedActionFingerprint, dto.expectedSnapshotHash);
   }
 
   @Get('simulacao/investimentos/balanceamento')

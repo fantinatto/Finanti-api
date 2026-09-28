@@ -5,6 +5,7 @@ import { InvestimentoService } from './investimento.service';
 import { UpsertSimulacaoConfigDto } from '../dto/upsert-simulacao-config.dto';
 import { UpsertInvestimentoDto } from '../dto/upsert-investimento.dto';
 import { arredondarParaLote, TAMANHO_FRACIONARIO, TAMANHO_LOTE } from './lote';
+import { PortfolioMove } from '../recommendation-engine/domain/portfolio-move';
 
 /**
  * Únicas categorias de RecomendacaoHolding que representam uma venda real hoje.
@@ -477,6 +478,7 @@ export class SimulacaoService {
     motivo: string | null,
     permiteFracionario: boolean,
     nomeSugerido?: string,
+    idempotencyKey?: string,
   ): Promise<{ transacao: TransacaoSimulacao | null; sobra: number }> {
     const quantidadeBruta = valorAporte / cotacao;
     const tamanhoUnidade = permiteFracionario ? TAMANHO_FRACIONARIO : TAMANHO_LOTE;
@@ -510,8 +512,86 @@ export class SimulacaoService {
       });
     }
 
-    const transacao = await this.registrarTransacao(tx, { userId, anoMes, tipo: 'compra', ticker, quantidade: qtd, preco: cotacao, origem, motivo });
+    const transacao = await this.registrarTransacao(tx, { userId, anoMes, tipo: 'compra', ticker, quantidade: qtd, preco: cotacao, origem, motivo, idempotencyKey });
     return { transacao, sobra };
+  }
+
+  /**
+   * Compra/reforço a partir de um `PortfolioMove` do motor novo (Next Best Action) — mesmo
+   * mecanismo de `comprarOuReforcar` (lote, cotação do mês, reforço/criação, débito de caixa),
+   * só que abrindo sua PRÓPRIA `$transaction` (o método privado espera um `tx` já aberto pelos
+   * fluxos antigos de aporte semanal/investir caixa). Sobra do arredondamento vira caixa, nunca
+   * desaparece (mesmo tratamento dos outros fluxos de compra).
+   */
+  async executarCompraDoMotor(userId: string, ticker: string, valorAporte: number, anoMes: string, idempotencyKey?: string): Promise<{ transacao: TransacaoSimulacao | null; sobra: number }> {
+    const cotacao = await this.buscarCotacao(ticker, anoMes);
+    if (cotacao == null) {
+      throw new BadRequestException(`Sem cotação de ${ticker} em ${anoMes} — não é possível executar.`);
+    }
+    const portfolioConfig = await this.prisma.portfolioConfig.findUnique({ where: { userId }, select: { permiteFracionario: true } });
+    const permiteFracionario = portfolioConfig?.permiteFracionario ?? true;
+
+    return this.prisma.$transaction(async (tx) => {
+      const { transacao, sobra } = await this.comprarOuReforcar(tx, userId, ticker, valorAporte, cotacao, anoMes, 'motor', null, permiteFracionario, undefined, idempotencyKey);
+      if (sobra > 0) {
+        await tx.simulacaoConfig.upsert({
+          where: { userId },
+          update: { caixaDisponivel: { increment: sobra } },
+          create: { userId, caixaDisponivel: sobra },
+        });
+      }
+      return { transacao, sobra };
+    });
+  }
+
+  /** Busca uma transação já executada pela MESMA confirmação (idempotência — ver
+   * RecommendationEngineService.executeNextBestAction). `null` se essa chave nunca foi usada. */
+  async buscarTransacaoPorIdempotencyKey(idempotencyKey: string): Promise<TransacaoSimulacao | null> {
+    return this.prisma.transacaoSimulacao.findUnique({ where: { idempotencyKey } });
+  }
+
+  /**
+   * Dispatcher único de execução real de um `PortfolioMove` do motor novo — SELL/REDUCE
+   * reaproveita `venderManual` tal qual (`sourcePositionId` já é o mesmo domínio de
+   * `Investimento.id`); BUY/ADD_NEW_POSITION vai por `executarCompraDoMotor`.
+   * `ROTATE_WITHIN_SECTOR` não tem bridge atômico venda+compra hoje — fora de escopo, erro
+   * explícito em vez de executar só metade do move.
+   *
+   * `executionDifference` é sempre contra o que REALMENTE foi persistido, nunca contra o
+   * estado hipotético do Search — lote/cotação/caixa disponível na hora de executar podem
+   * mudar o número final (arredondamento, sobra por unidade). O PRÓXIMO snapshot (fora deste
+   * método) sempre vem de `PortfolioSnapshotService.build()` lido do banco, nunca do
+   * `StateTransition.apply` em memória.
+   */
+  async executarMoveDoMotor(
+    userId: string,
+    move: PortfolioMove,
+    anoMes: string,
+    idempotencyKey?: string,
+  ): Promise<{ projectedMove: PortfolioMove; executedTransaction: TransacaoSimulacao; executionDifference: { quantityDiff: number; amountDiff: number } }> {
+    let executedTransaction: TransacaoSimulacao | null;
+
+    if (move.type === 'SELL' || move.type === 'REDUCE') {
+      executedTransaction = await this.venderManual(userId, move.sourcePositionId!, move.quantity!, anoMes, idempotencyKey);
+    } else if (move.type === 'BUY' || move.type === 'ADD_NEW_POSITION') {
+      const { transacao } = await this.executarCompraDoMotor(userId, move.targetTicker!, move.amount, anoMes, idempotencyKey);
+      executedTransaction = transacao;
+    } else {
+      throw new BadRequestException(`Execução real de ${move.type} ainda não é suportada — sem bridge atômico venda+compra pro motor novo.`);
+    }
+
+    if (!executedTransaction) {
+      throw new BadRequestException(`${move.type} de ${move.targetTicker ?? move.sourceTicker} não gerou nenhuma transação (valor menor que 1 unidade após arredondamento).`);
+    }
+
+    return {
+      projectedMove: move,
+      executedTransaction,
+      executionDifference: {
+        quantityDiff: executedTransaction.quantidade - (move.quantity ?? 0),
+        amountDiff: executedTransaction.valor - move.amount,
+      },
+    };
   }
 
   /**
@@ -520,7 +600,7 @@ export class SimulacaoService {
    * TransacaoSimulacao com ganhoRealizado apurado ao precoMedio ANTES da venda, e credita o
    * valor em caixaDisponivel (sem destino de reinvestimento automático — igual reducao_risco).
    */
-  async venderManual(userId: string, investimentoId: string, quantidade: number, anoMes: string) {
+  async venderManual(userId: string, investimentoId: string, quantidade: number, anoMes: string, idempotencyKey?: string) {
     const inv = await this.investimentos.garantirDono(userId, investimentoId, 'simulacao');
     if (quantidade <= 0) {
       throw new BadRequestException('Quantidade a vender precisa ser maior que zero.');
@@ -552,9 +632,10 @@ export class SimulacaoService {
         ticker: inv.ticker as string,
         quantidade,
         preco: cotacaoAtual,
-        origem: 'manual',
+        origem: idempotencyKey ? 'motor' : 'manual',
         motivo: null,
         ganhoRealizado: ganhoRealizadoVenda,
+        idempotencyKey,
       });
 
       await tx.simulacaoConfig.upsert({
@@ -580,6 +661,9 @@ export class SimulacaoService {
       motivo: string | null;
       /** Só em vendas — ver comentário do campo no schema. Ausente em compras (fica null). */
       ganhoRealizado?: number;
+      /** Só em execuções vindas do motor novo (Next Best Action) — ver
+       * RecommendationEngineService.executeNextBestAction. */
+      idempotencyKey?: string;
     },
   ) {
     return tx.transacaoSimulacao.create({ data: { ...dados, valor: dados.quantidade * dados.preco } });

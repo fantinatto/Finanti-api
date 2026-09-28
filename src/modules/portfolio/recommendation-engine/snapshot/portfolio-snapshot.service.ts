@@ -2,7 +2,18 @@ import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../../../common/prisma/prisma.service';
 import { RankingQueryService } from '../../../market-data/services/ranking-query.service';
 import { InvestimentoService, TipoCarteira, TipoRankingRecomendacao } from '../../services/investimento.service';
-import { InvestmentCandidateMetadata, OrigemScore, PortfolioPositionState, PortfolioState, SectorAllocationState } from '../domain/portfolio-state';
+import {
+  availableToInvest,
+  computeSectorAllocation,
+  computeSegmentConcentration,
+  InvestmentCandidateMetadata,
+  OrigemScore,
+  PortfolioPositionState,
+  PortfolioState,
+} from '../domain/portfolio-state';
+import { computeSectorMarketStates } from '../domain/sector-market-state';
+import { DEFAULT_DYNAMIC_REBALANCE_CONFIG, DynamicAllocationBandResult, RebalanceToleranceMode } from '../domain/dynamic-allocation-band';
+import { DynamicAllocationBandService } from '../allocation-band/dynamic-allocation-band.service';
 
 const PERCENTUAL_ESTOURO_PADRAO = 5;
 const TIPO_RANKING_PADRAO: TipoRankingRecomendacao = 'setor';
@@ -33,6 +44,7 @@ export class PortfolioSnapshotService {
     private readonly prisma: PrismaService,
     private readonly rankingQuery: RankingQueryService,
     private readonly investimentos: InvestimentoService,
+    private readonly dynamicAllocationBandService: DynamicAllocationBandService,
   ) {}
 
   async build(userId: string, anoMes: string, carteira: TipoCarteira): Promise<PortfolioState> {
@@ -105,32 +117,65 @@ export class PortfolioSnapshotService {
       valorPorSetor.set(p.setor, (valorPorSetor.get(p.setor) ?? 0) + p.valorAtual);
     }
 
-    const setoresNomes = new Set([...alocacoesAlvo.keys(), ...valorPorSetor.keys()]);
-    const sectors: SectorAllocationState[] = [...setoresNomes].map((setor) => {
-      const valorAtual = valorPorSetor.get(setor) ?? 0;
-      const percentualAtual = valorTotalAcoes > 0 ? (valorAtual / valorTotalAcoes) * 100 : 0;
-      const percentualAlvo = alocacoesAlvo.get(setor) ?? 0;
-      const diferenca = percentualAtual - percentualAlvo;
-      let status: SectorAllocationState['status'] = 'equilibrado';
-      if (diferenca > percentualEstouro) status = 'sobrealocado';
-      else if (diferenca < -percentualEstouro) status = 'subalocado';
-      return { setor, valorAtual, percentualAtual, percentualAlvo, diferenca, status, semNenhumaAcao: valorAtual <= 0 && percentualAlvo > 0 };
-    });
-
-    const investmentUniverse = await this.buildInvestmentUniverse(anoMes, tipoRanking, hibridoRows);
-
     const existingCash =
       carteira === 'simulacao' ? ((await this.prisma.simulacaoConfig.findUnique({ where: { userId } }))?.caixaDisponivel ?? 0) : 0;
+    const capital = { existingCash, externalContributionBudget: 0, proceedsGeneratedByPlan: 0 };
+    // Capturada UMA VEZ aqui, no estado inicial — StateTransition.apply nunca recalcula isso, só
+    // copia adiante (ver comentário do campo em domain/portfolio-state.ts).
+    const searchAllocationBase = valorTotalAcoes + availableToInvest(capital);
+
+    // Denominador VIVO (legado/B1, bit-a-bit igual à matriz atual) vs ESTÁVEL (searchAllocationBase,
+    // usado por generateB2/busca em diante — ver "achado" do Estouro Dinâmico no plano).
+    const sectors = computeSectorAllocation(valorPorSetor, alocacoesAlvo, valorTotalAcoes, percentualEstouro);
+    const stableSectors = computeSectorAllocation(valorPorSetor, alocacoesAlvo, searchAllocationBase, percentualEstouro);
+
+    const investmentUniverse = await this.buildInvestmentUniverse(anoMes, tipoRanking, hibridoRows);
+    const segmentConcentration = computeSegmentConcentration(positions, investmentUniverse, sectors);
+    const sectorMarketStates = computeSectorMarketStates(investmentUniverse);
+
+    const rebalanceToleranceMode: RebalanceToleranceMode = (config?.rebalanceToleranceMode as RebalanceToleranceMode) ?? 'FIXED';
+    const dynamicRebalanceConfig = {
+      maxAdjustment: config?.dynamicMaxAdjustment ?? DEFAULT_DYNAMIC_REBALANCE_CONFIG.maxAdjustment,
+      guardrailEnabled: config?.dynamicGuardrailEnabled ?? DEFAULT_DYNAMIC_REBALANCE_CONFIG.guardrailEnabled,
+    };
+
+    let dynamicAllocationBands: DynamicAllocationBandResult[] = [];
+    let dynamicSectors = stableSectors;
+    if (rebalanceToleranceMode === 'DYNAMIC_PRICE') {
+      const marketStatePorSetor = new Map(sectorMarketStates.map((s) => [s.setor, s]));
+      dynamicAllocationBands = stableSectors.map((s) =>
+        this.dynamicAllocationBandService.calculate({
+          setor: s.setor,
+          target: s.percentualAlvo,
+          percentualAtual: s.percentualAtual,
+          baseTolerance: percentualEstouro,
+          marketState: marketStatePorSetor.get(s.setor),
+          universo: sectorMarketStates,
+          maxAdjustment: dynamicRebalanceConfig.maxAdjustment,
+          guardrailEnabled: dynamicRebalanceConfig.guardrailEnabled,
+        }),
+      );
+      const bandaPorSetor = new Map(dynamicAllocationBands.map((b) => [b.setor, b]));
+      dynamicSectors = stableSectors.map((s) => ({ ...s, status: bandaPorSetor.get(s.setor)?.status ?? s.status }));
+    }
 
     return {
       userId,
       anoMes,
       carteira,
       positions,
-      capital: { existingCash, externalContributionBudget: 0, proceedsGeneratedByPlan: 0 },
+      capital,
       valorTotalAcoes,
       valorTotalCarteira,
+      searchAllocationBase,
       sectors,
+      stableSectors,
+      dynamicSectors,
+      sectorMarketStates,
+      dynamicAllocationBands,
+      rebalanceToleranceMode,
+      dynamicRebalanceConfig,
+      segmentConcentration,
       percentualEstouro,
       permiteFracionario,
       tipoRanking,
@@ -190,6 +235,7 @@ export class PortfolioSnapshotService {
       // só tem 1 score nesse tier: o do seu próprio setor, ou o geral único).
       const rows = await this.prisma.scoreNormalizado.findMany({
         where: { tipoGrupo: tipoRanking, anoMes, scoreFinal: { not: null } },
+        orderBy: { ticker: 'asc' },
       });
       for (const r of rows) {
         scorePorTicker.set(r.ticker, {

@@ -1,4 +1,5 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable } from '@nestjs/common';
+import { createHash } from 'crypto';
 import {
   CategoriaAcao,
   PRIORIDADE_POR_CATEGORIA,
@@ -6,14 +7,21 @@ import {
   RecomendacaoHolding,
   TipoCarteira,
 } from '../services/investimento.service';
+import { SimulacaoService } from '../services/simulacao.service';
 import { PortfolioSnapshotService } from './snapshot/portfolio-snapshot.service';
 import { PortfolioEvaluatorService } from './evaluation/portfolio-evaluator.service';
-import { CandidatoParaComparar, CriterioDecisao, PortfolioEvaluationComparatorService } from './evaluation/portfolio-evaluation-comparator.service';
+import { CandidatoParaComparar, CriterioDecisao, DEFAULT_BALANCE_MATERIALITY_THRESHOLD_PP, PortfolioEvaluationComparatorService } from './evaluation/portfolio-evaluation-comparator.service';
 import { CandidateSeedConfig, PortfolioMoveGeneratorService } from './moves/portfolio-move-generator.service';
 import { PortfolioMoveValidatorService } from './moves/portfolio-move-validator.service';
 import { PortfolioStateTransitionService } from './simulation/portfolio-state-transition.service';
-import { PortfolioMove } from './domain/portfolio-move';
-import { PortfolioPositionState, PortfolioState } from './domain/portfolio-state';
+import { PortfolioSearchEngineService } from './search/portfolio-search-engine.service';
+import { PortfolioStateHashService } from './search/portfolio-state-hash.service';
+import { PortfolioDecisionTraceService } from './explainability/portfolio-decision-trace.service';
+import { actionFingerprint, detectRoundTripSameTicker, hasSufficientFunding, PortfolioMove } from './domain/portfolio-move';
+import { availableToInvest, PortfolioPositionState, PortfolioState } from './domain/portfolio-state';
+import { DEFAULT_SEARCH_CONFIG } from './domain/portfolio-search';
+import { PolicyDiagnostics, RECOMMENDATION_ENGINE_VERSION, RecommendationPreviewResult, RecommendationPreviewStep } from './domain/portfolio-preview';
+import { SegmentDiversificationAdmissibilityService } from './segment-diversification/segment-diversification-admissibility.service';
 
 /** Um candidato avaliado dentro de uma necessidade (setor + tipo) — expõe o move, o estado
  * resultante e a avaliação, pra auditoria (por que o vencedor venceu). */
@@ -46,19 +54,31 @@ export class RecommendationEngineService {
     private readonly moveGenerator: PortfolioMoveGeneratorService,
     private readonly moveValidator: PortfolioMoveValidatorService,
     private readonly transitionService: PortfolioStateTransitionService,
+    private readonly searchEngine: PortfolioSearchEngineService,
+    private readonly decisionTrace: PortfolioDecisionTraceService,
+    private readonly segmentDiversificationAdmissibility: SegmentDiversificationAdmissibilityService,
+    private readonly hasher: PortfolioStateHashService,
+    private readonly simulacaoService: SimulacaoService,
   ) {}
 
   async getRecomendacoesB1(userId: string, anoMes: string, carteira: TipoCarteira): Promise<RecomendacaoHolding[]> {
     const state = await this.snapshotService.build(userId, anoMes, carteira);
-    const { moves, suppressedByAvailableCash } = this.moveGenerator.generateB1(state);
+    const { moves, suppressedByAvailableCash, legacyCarryForwardSuggestions } = this.moveGenerator.generateB1(state);
     const movesValidos = moves.filter((m) => this.moveValidator.validate(state, m));
-    return this.converterParaRecomendacoes(state, movesValidos, suppressedByAvailableCash);
+    return this.converterParaRecomendacoes(state, movesValidos, suppressedByAvailableCash, legacyCarryForwardSuggestions);
   }
 
+  /**
+   * Adapter LEGADO — só existe pra reproduzir `InvestimentoService.getRecomendacoes` bit-a-bit
+   * (Fase B1). `legacyCarryForwardSuggestions` é consumido SÓ aqui, nunca por `PortfolioMove`/
+   * `StateTransition`/comparador (B2 em diante) — mantém a peculiaridade de compatibilidade
+   * isolada do domínio novo, a pedido do usuário.
+   */
   private converterParaRecomendacoes(
     state: PortfolioState,
     moves: PortfolioMove[],
     suppressedByAvailableCash: Set<string>,
+    legacyCarryForwardSuggestions: Map<string, { amount: number; quantity: number | null }>,
   ): RecomendacaoHolding[] {
     const movePorPosicao = new Map<string, PortfolioMove>();
     for (const m of moves) {
@@ -91,11 +111,13 @@ export class RecommendationEngineService {
             const alvo = universoPorTicker.get(move.targetTicker!);
             sugestaoTroca = { ticker: move.targetTicker!, nome: alvo?.nome ?? move.targetTicker!, scoreFinal: alvo?.scoreFinal ?? null };
             deltaScoreTroca = alvo?.scoreFinal != null && p.scoreFinal != null ? alvo.scoreFinal - p.scoreFinal : null;
-            // Particularidade real da matriz atual (ver domain/portfolio-move.ts): o valor do
-            // rateio de compra continua aparecendo mesmo quando a categoria virou troca_sugerida.
-            if (move.carryForwardSuggestion) {
-              valorSugerido = move.carryForwardSuggestion.amount;
-              quantidadeSugerida = move.carryForwardSuggestion.quantity;
+            // Particularidade real da matriz atual (isolada aqui, fora do domínio — ver comentário
+            // da classe): o valor do rateio de compra continua aparecendo mesmo quando a categoria
+            // virou troca_sugerida.
+            const carryForward = legacyCarryForwardSuggestions.get(p.id);
+            if (carryForward) {
+              valorSugerido = carryForward.amount;
+              quantidadeSugerida = carryForward.quantity;
               sugestaoRebalanceamento = 'comprar';
             }
             break;
@@ -169,8 +191,11 @@ export class RecommendationEngineService {
    */
   async getEscolhasB2(userId: string, anoMes: string, carteira: TipoCarteira, seeds?: CandidateSeedConfig): Promise<EscolhaB2[]> {
     const state = await this.snapshotService.build(userId, anoMes, carteira);
-    const before = this.evaluatorService.evaluate(state);
-    const moves = this.moveGenerator.generateB2(state, seeds).filter((m) => this.moveValidator.validate(state, m));
+    const moves = this.moveGenerator
+      .generateB2(state, seeds)
+      .moves.filter((m) => this.moveValidator.validate(state, m))
+      .filter((m) => hasSufficientFunding(state, m))
+      .filter((m) => this.segmentDiversificationAdmissibility.isAdmissible(state, m));
 
     const grupos = new Map<string, PortfolioMove[]>();
     for (const m of moves) {
@@ -185,7 +210,7 @@ export class RecommendationEngineService {
       const [setor, necessidade] = key.split('::') as [string, 'sobrealocado' | 'subalocado'];
       const candidatos: CandidatoAvaliadoB2[] = candidatosMoves.map((m) => ({
         move: m,
-        evaluation: this.evaluatorService.evaluate(this.transitionService.apply(state, m)),
+        evaluation: this.evaluatorService.evaluate(this.transitionService.apply(state, m).state),
       }));
 
       let vencedorIdx = 0;
@@ -196,7 +221,6 @@ export class RecommendationEngineService {
         const atual = candidatos[vencedorIdx];
         const desafiante = candidatos[i];
         const cmp = this.comparatorService.compare(
-          before,
           this.candidatoParaComparar(state, atual),
           this.candidatoParaComparar(state, desafiante),
         );
@@ -218,6 +242,162 @@ export class RecommendationEngineService {
     return resultado;
   }
 
+  /**
+   * Preview do motor novo (Search Engine depth=3 + Decision Trace) — só leitura, nenhuma
+   * mutação. Deliberadamente PARALELO a `getRecomendacoesB1`/`getEscolhasB2`/`getRecomendacoes`
+   * legado — não substitui nenhum dos dois. `saleNotional`/`purchaseNotional`/`capitalBefore`/
+   * `capitalAfter` por passo não existem no `RecommendationPlanStep` do Decision Trace, então
+   * reaplica `bestLine.moves` uma segunda vez via `StateTransitionService` só pra extrair esses
+   * números — barato (só `bestLine.moves.length` chamadas a mais) e não toca no Decision Trace.
+   */
+  /** Reconstrói o snapshot do zero (fresh do banco) e roda o Search — usado tanto pelo Preview
+   * quanto pela execução real (`executeNextBestAction`), que NUNCA confia num move vindo do
+   * client: sempre re-deriva a Next Best Action rodando isso de novo no momento da execução. */
+  private async runSearch(userId: string, anoMes: string, carteira: TipoCarteira) {
+    const state = await this.snapshotService.build(userId, anoMes, carteira);
+    const rootEvaluation = this.evaluatorService.evaluate(state);
+    const searchConfig = { ...DEFAULT_SEARCH_CONFIG, maxDepth: 3 };
+    const result = this.searchEngine.search(state, searchConfig);
+    return { state, rootEvaluation, searchConfig, result };
+  }
+
+  async getPreview(userId: string, anoMes: string, carteira: TipoCarteira = 'real'): Promise<RecommendationPreviewResult> {
+    const { state, rootEvaluation, searchConfig, result } = await this.runSearch(userId, anoMes, carteira);
+    const trace = this.decisionTrace.build(state, rootEvaluation, result.bestLine, searchConfig);
+
+    let current = state;
+    const steps: RecommendationPreviewStep[] = result.bestLine.moves.map((move, i) => {
+      const capitalBefore = current.capital;
+      const { state: next, saleNotional, purchaseNotional } = this.transitionService.apply(current, move);
+      const passo = trace.steps[i];
+      const step: RecommendationPreviewStep = {
+        sequence: i + 1,
+        move,
+        saleNotional,
+        purchaseNotional,
+        capitalBefore,
+        capitalAfter: next.capital,
+        evaluationBefore: passo.beforeEvaluation,
+        evaluationAfter: passo.afterEvaluation,
+        decidedBy: passo.decidedBy,
+        candidateOutcomes: passo.candidateOutcomes,
+        bandaSetor: passo.bandaSetor,
+      };
+      current = next;
+      return step;
+    });
+
+    const policyDiagnostics: PolicyDiagnostics = {
+      totalExcluded: 0,
+      byReason: { OWNERSHIP_WEAK: 0, ENTRY_EXPENSIVE: 0, FALLBACK_TO_ELIGIBLE: 0 },
+      perStep: trace.steps.map((passo) => ({
+        sequence: passo.sequence,
+        setor: passo.move.setor,
+        excluded: passo.policyExclusions.map((e) => ({ ticker: e.ticker, ownership: e.assessment.ownership.status, entry: e.assessment.entry.status, eligibility: e.assessment.eligibility })),
+      })),
+    };
+    for (const passo of trace.steps) {
+      for (const exclusao of passo.policyExclusions) {
+        policyDiagnostics.totalExcluded++;
+        if (exclusao.assessment.eligibility === 'ELIGIBLE') policyDiagnostics.byReason.FALLBACK_TO_ELIGIBLE++;
+        else if (exclusao.assessment.ownership.status === 'WEAK') policyDiagnostics.byReason.OWNERSHIP_WEAK++;
+        else policyDiagnostics.byReason.ENTRY_EXPENSIVE++;
+      }
+    }
+
+    // Ver plano "Next Best Action": só steps[0] é recomendação real, o resto é projeção. Sem
+    // nenhum move admissível, distingue "nada foi gerado" de "Comparator escolheu ficar parado"
+    // usando o que o Search já expõe (statesGenerated) — nenhuma mudança dentro do Search.
+    const nextBestAction = steps[0] ?? null;
+    const terminalReason = nextBestAction ? undefined : result.metadata.statesGenerated === 0 ? ('NO_ADMISSIBLE_MOVE' as const) : ('STOP_SELECTED' as const);
+    const nextBestActionFingerprint = nextBestAction ? actionFingerprint(nextBestAction.move) : undefined;
+    const snapshotHash = this.hasher.economicStateHash(state);
+
+    return {
+      engineVersion: RECOMMENDATION_ENGINE_VERSION,
+      generatedAt: new Date().toISOString(),
+      carteira,
+      anoMes,
+      snapshot: {
+        portfolioValue: state.valorTotalCarteira,
+        investedValue: state.valorTotalAcoes,
+        availableCapital: availableToInvest(state.capital),
+        rankingVersion: state.rankingVersion,
+        snapshotHash,
+      },
+      initialEvaluation: rootEvaluation,
+      bestPlan: {
+        steps,
+        nextBestAction,
+        nextBestActionFingerprint,
+        projectedPath: steps.slice(1),
+        terminalReason,
+        finalEvaluation: result.bestLine.finalEvaluation,
+        turnover: result.bestLine.cumulativeTurnover,
+        capitalResidual: current.capital,
+      },
+      policyDiagnostics,
+      alternatives: result.alternatives.map((a) => ({ moves: a.moves, finalEvaluation: a.finalEvaluation, turnover: a.cumulativeTurnover })),
+      searchMetadata: result.metadata,
+      config: {
+        maxDepth: searchConfig.maxDepth,
+        beamWidth: searchConfig.beamWidth,
+        maxMovesPerNode: searchConfig.maxMovesPerNode,
+        rebalanceToleranceMode: state.rebalanceToleranceMode,
+        balanceMaterialityThresholdPp: DEFAULT_BALANCE_MATERIALITY_THRESHOLD_PP,
+        engineVersion: RECOMMENDATION_ENGINE_VERSION,
+        rankingVersion: state.rankingVersion,
+      },
+    };
+  }
+
+  /**
+   * Executa de verdade a Next Best Action — ver plano "Next Best Action / Receding Horizon".
+   * NUNCA confia no move do client: reconstrói o snapshot e roda o Search de novo aqui dentro,
+   * e só executa se a ação recalculada bater com a que o usuário confirmou olhando o Preview
+   * (`expectedActionFingerprint`/`expectedSnapshotHash` — anti-stale). Idempotência SEPARADA do
+   * anti-stale: a MESMA confirmação (mesma chave) nunca persiste 2 transações, mesmo em duplo
+   * clique/retry — devolve a transação já existente em vez de executar de novo.
+   */
+  async executeNextBestAction(
+    userId: string,
+    anoMes: string,
+    carteira: TipoCarteira,
+    expectedActionFingerprint: string,
+    expectedSnapshotHash: string,
+  ): Promise<
+    | { status: 'EXECUTED'; projectedMove: PortfolioMove; executedTransaction: unknown; executionDifference: { quantityDiff: number; amountDiff: number } }
+    | { status: 'ALREADY_EXECUTED'; executedTransaction: unknown }
+  > {
+    const { state, result } = await this.runSearch(userId, anoMes, carteira);
+    const nextBestAction = result.bestLine.moves[0] ?? null;
+
+    if (!nextBestAction) {
+      throw new ConflictException({ code: 'NEXT_BEST_ACTION_CHANGED', reason: 'NO_ADMISSIBLE_MOVE_NOW', currentNextBestAction: null });
+    }
+
+    const currentFingerprint = actionFingerprint(nextBestAction);
+    const currentSnapshotHash = this.hasher.economicStateHash(state);
+
+    if (currentFingerprint !== expectedActionFingerprint || currentSnapshotHash !== expectedSnapshotHash) {
+      throw new ConflictException({
+        code: 'NEXT_BEST_ACTION_CHANGED',
+        currentNextBestAction: nextBestAction,
+        currentSnapshotHash,
+      });
+    }
+
+    const idempotencyKey = createHash('sha256').update(`${userId}::${currentSnapshotHash}::${currentFingerprint}`).digest('hex');
+
+    const jaExecutada = await this.simulacaoService.buscarTransacaoPorIdempotencyKey(idempotencyKey);
+    if (jaExecutada) {
+      return { status: 'ALREADY_EXECUTED', executedTransaction: jaExecutada };
+    }
+
+    const { projectedMove, executedTransaction, executionDifference } = await this.simulacaoService.executarMoveDoMotor(userId, nextBestAction, anoMes, idempotencyKey);
+    return { status: 'EXECUTED', projectedMove, executedTransaction, executionDifference };
+  }
+
   private candidatoParaComparar(state: PortfolioState, candidato: CandidatoAvaliadoB2): CandidatoParaComparar {
     const ticker = candidato.move.targetTicker ?? candidato.move.sourceTicker;
     const scoreFinalResultante =
@@ -227,6 +407,8 @@ export class RecommendationEngineService {
       amount: candidato.move.amount,
       confidence: candidato.move.confidence,
       scoreFinalResultante,
+      // Comparação de UM move isolado (sem histórico multi-move) — round-trip nunca se aplica aqui.
+      roundTripDetected: detectRoundTripSameTicker([candidato.move]).length > 0,
     };
   }
 }

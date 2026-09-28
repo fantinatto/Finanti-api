@@ -13,6 +13,7 @@ export class AlocacaoItemDto {
 
 const REGRAS_VALIDAS = ['base80', 'base100', 'base110', 'base120', 'base_di', 'base_custom'] as const;
 const TIPOS_RANKING_VALIDOS = ['setor', 'segmento', 'geral', 'hibrido'] as const;
+const MODOS_TOLERANCIA_VALIDOS = ['FIXED', 'DYNAMIC_PRICE'] as const;
 
 export class UpsertPortfolioConfigDto {
   @IsNumber()
@@ -51,6 +52,22 @@ export class UpsertPortfolioConfigDto {
   @IsOptional()
   @IsBoolean()
   permiteFracionario?: boolean;
+
+  /** "FIXED" (padrão) ou "DYNAMIC_PRICE" — motor novo de recomendações, ver
+   * DynamicAllocationBandService. Produção continua "FIXED". */
+  @IsOptional()
+  @IsIn(MODOS_TOLERANCIA_VALIDOS)
+  rebalanceToleranceMode?: (typeof MODOS_TOLERANCIA_VALIDOS)[number];
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(20)
+  dynamicMaxAdjustment?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  dynamicGuardrailEnabled?: boolean;
 
   @IsArray()
   @ValidateNested({ each: true })

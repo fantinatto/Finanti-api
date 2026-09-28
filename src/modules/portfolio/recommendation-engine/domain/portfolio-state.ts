@@ -1,4 +1,6 @@
 import { TipoCarteira, TipoRankingRecomendacao } from '../../services/investimento.service';
+import { SectorMarketState } from './sector-market-state';
+import { DynamicAllocationBandResult, DynamicRebalanceConfig, RebalanceToleranceMode } from './dynamic-allocation-band';
 
 /** Origem do score de um ticker — binário nesta fase (ver plano, "RankingConfidence graduado"
  * fica pra quando alguma fase futura precisar de um 3º nível real, hoje seria fabricado sem
@@ -39,6 +41,119 @@ export interface SectorAllocationState {
   status: 'sobrealocado' | 'subalocado' | 'equilibrado';
   /** true quando o setor tem alvo configurado mas ZERO ações hoje — "setor descoberto". */
   semNenhumaAcao: boolean;
+}
+
+/** Classificação por banda [min,max] — mesma regra estrutural usada tanto pela banda FIXA
+ * (`computeSectorAllocation`, min/max = target∓percentualEstouro) quanto pela banda DINÂMICA
+ * (`DynamicAllocationBandService`, min/max vêm da atratividade de Preço) — garante que as duas
+ * classificam do mesmo jeito, só a banda em si muda. */
+export function deriveSectorStatus(percentualAtual: number, min: number, max: number): SectorAllocationState['status'] {
+  if (percentualAtual > max) return 'sobrealocado';
+  if (percentualAtual < min) return 'subalocado';
+  return 'equilibrado';
+}
+
+/** Função pura compartilhada por `PortfolioSnapshotService` (estado inicial) e
+ * `PortfolioStateTransitionService.recalcularAgregados` (após cada move) — antes dessa extração,
+ * a mesma lógica estava duplicada inline nos dois lugares. Chamada com denominadores diferentes
+ * produz `sectors` (denominador vivo, legado/B1) e `stableSectors` (denominador estável,
+ * `searchAllocationBase`, usado por B2/busca em diante — ver "achado" do Estouro Dinâmico:
+ * `generateB2` precisa da MESMA base que `PortfolioEvaluatorService` usa pra pontuar). */
+export function computeSectorAllocation(
+  valorPorSetor: Map<string, number>,
+  alocacoesAlvo: Map<string, number>,
+  denominador: number,
+  percentualEstouro: number,
+): SectorAllocationState[] {
+  const setoresNomes = new Set([...alocacoesAlvo.keys(), ...valorPorSetor.keys()]);
+  return [...setoresNomes].map((setor) => {
+    const valorAtual = valorPorSetor.get(setor) ?? 0;
+    const percentualAtual = denominador > 0 ? (valorAtual / denominador) * 100 : 0;
+    const percentualAlvo = alocacoesAlvo.get(setor) ?? 0;
+    const diferenca = percentualAtual - percentualAlvo;
+    const status = deriveSectorStatus(percentualAtual, percentualAlvo - percentualEstouro, percentualAlvo + percentualEstouro);
+    return { setor, valorAtual, percentualAtual, percentualAlvo, diferenca, status, semNenhumaAcao: valorAtual <= 0 && percentualAlvo > 0 };
+  });
+}
+
+/** Participação de UM segmento dentro de UM setor (não da carteira) — ver Fase C.1. */
+export interface SegmentAllocationState {
+  setor: string;
+  segmento: string;
+  valorAtual: number;
+  percentualDoSetor: number;
+  numeroPosicoes: number;
+}
+
+/** Concentração de segmento dentro de um setor — sinal estrutural que `SectorAllocationState`
+ * sozinho não enxerga (um setor pode estar "equilibrado" no agregado e ainda assim 100%
+ * concentrado num único segmento, ex: Financeiro só com Bancos, nada em Seguros/Bolsas). */
+export interface SegmentConcentration {
+  setor: string;
+  segments: SegmentAllocationState[];
+  maxSegmentShare: number;
+  /** quantos segmentos distintos têm score calculável no universo pra este setor — evita marcar
+   * "concentrado" um setor genuinamente mono-segmento (nada de verdade pra diversificar). */
+  segmentosDisponiveisNoUniverso: number;
+  concentrado: boolean;
+}
+
+/** % do setor concentrado num único segmento a partir do qual `concentrado=true`. Explícito e
+ * isolado (mesmo espírito de `percentualEstouro`/`DELTA_SCORE_TROCA`) — fácil de revisar/ajustar. */
+export const LIMIAR_CONCENTRACAO_SEGMENTO = 70;
+
+/** Função pura compartilhada por `PortfolioSnapshotService` (estado inicial) e
+ * `PortfolioStateTransitionService.recalcularAgregados` (após cada move) — ao contrário de
+ * `sectors` (lógica antiga, já duplicada nos dois lugares e validada), esse cálculo é NOVO, então
+ * uma função só evita duas implementações divergirem silenciosamente. */
+export function computeSegmentConcentration(
+  positions: PortfolioPositionState[],
+  investmentUniverse: InvestmentCandidateMetadata[],
+  sectors: SectorAllocationState[],
+): SegmentConcentration[] {
+  const segmentosNoUniversoPorSetor = new Map<string, Set<string>>();
+  for (const c of investmentUniverse) {
+    if (!c.setor || !c.segmento || c.scoreFinal == null) continue;
+    if (!segmentosNoUniversoPorSetor.has(c.setor)) segmentosNoUniversoPorSetor.set(c.setor, new Set());
+    segmentosNoUniversoPorSetor.get(c.setor)!.add(c.segmento);
+  }
+
+  const resultado: SegmentConcentration[] = [];
+  for (const setorInfo of sectors) {
+    const posicoesDoSetor = positions.filter((p) => p.setor === setorInfo.setor);
+    if (!posicoesDoSetor.length) continue;
+
+    const porSegmento = new Map<string, { valorAtual: number; numeroPosicoes: number }>();
+    for (const p of posicoesDoSetor) {
+      const segmento = p.segmento ?? 'sem_segmento';
+      const atual = porSegmento.get(segmento) ?? { valorAtual: 0, numeroPosicoes: 0 };
+      atual.valorAtual += p.valorAtual;
+      atual.numeroPosicoes += 1;
+      porSegmento.set(segmento, atual);
+    }
+
+    const valorTotalSetor = posicoesDoSetor.reduce((acc, p) => acc + p.valorAtual, 0);
+    const segments: SegmentAllocationState[] = [...porSegmento.entries()].map(([segmento, v]) => ({
+      setor: setorInfo.setor,
+      segmento,
+      valorAtual: v.valorAtual,
+      percentualDoSetor: valorTotalSetor > 0 ? (v.valorAtual / valorTotalSetor) * 100 : 0,
+      numeroPosicoes: v.numeroPosicoes,
+    }));
+
+    const maxSegmentShare = segments.reduce((max, s) => Math.max(max, s.percentualDoSetor), 0);
+    const segmentosDisponiveisNoUniverso = segmentosNoUniversoPorSetor.get(setorInfo.setor)?.size ?? segments.length;
+
+    resultado.push({
+      setor: setorInfo.setor,
+      segments,
+      maxSegmentShare,
+      segmentosDisponiveisNoUniverso,
+      concentrado: maxSegmentShare >= LIMIAR_CONCENTRACAO_SEGMENTO && segmentosDisponiveisNoUniverso > 1,
+    });
+  }
+
+  return resultado;
 }
 
 /** Todo ticker do universo com score calculável nesse anoMes/tipoRanking — não só os possuídos.
@@ -96,7 +211,35 @@ export interface PortfolioState {
    * rebalanceamento setorial) — `positions` aqui só contém ações, então esse total não dá pra
    * derivar delas sozinho. */
   valorTotalCarteira: number;
+  /** Base ESTÁVEL pra % de setor no `search` (health/balance internos do motor) — capturada UMA
+   * VEZ no snapshot (valorTotalAcoes + availableToInvest(capital) no estado inicial) e nunca
+   * recomputada por StateTransition. Sem isso, vender uma posição sem recompra imediata encolhe
+   * `valorTotalAcoes` e faz TODOS os outros setores parecerem mais alocados só porque o
+   * denominador caiu — não porque mudou algo neles (invariante pedido pelo usuário antes da Fase
+   * C). Os campos `sectors[].percentualAtual` legados (usados por B1/wrappers, bit-a-bit iguais
+   * ao sistema atual) continuam usando o denominador vivo — essa base só alimenta o `search`. */
+  searchAllocationBase: number;
   sectors: SectorAllocationState[];
+  /** Mesma info de `sectors`, mas com `percentualAtual`/`status` medidos contra
+   * `searchAllocationBase` (denominador estável) em vez de `valorTotalAcoes` (vivo) — é o que
+   * `generateB2`/busca em diante devem usar (ver "Estouro Dinâmico"/achado do pré-requisito:
+   * antes disso, `generateB2` decidia por um denominador diferente do que o Comparator pontuava).
+   * `generateB1` continua em `sectors` — preserva compatibilidade bit-a-bit com a matriz legada. */
+  stableSectors: SectorAllocationState[];
+  /** = `stableSectors` em modo `rebalanceToleranceMode='FIXED'`; em modo `'DYNAMIC_PRICE'`, mesmos
+   * valores/target, mas `status` recalculado pela banda de `dynamicAllocationBands` (min/max por
+   * atratividade de Preço) em vez de `±percentualEstouro`. É isso que `generateB2` consome. */
+  dynamicSectors: SectorAllocationState[];
+  /** Preço/Qualidade/Risco agregados (Δ, top-3 por setor) — insumo da banda dinâmica, calculado
+   * uma vez no snapshot a partir de `investmentUniverse` (zero query nova). */
+  sectorMarketStates: SectorMarketState[];
+  /** Auditoria completa da banda dinâmica por setor (Decision Trace) — vazio em modo `'FIXED'`. */
+  dynamicAllocationBands: DynamicAllocationBandResult[];
+  rebalanceToleranceMode: RebalanceToleranceMode;
+  dynamicRebalanceConfig: DynamicRebalanceConfig;
+  /** Concentração de segmento por setor (Fase C.1) — recalculado junto com `sectors`, tanto no
+   * snapshot quanto a cada `StateTransition.apply` (ver `computeSegmentConcentration`). */
+  segmentConcentration: SegmentConcentration[];
   percentualEstouro: number;
   permiteFracionario: boolean;
   tipoRanking: TipoRankingRecomendacao;

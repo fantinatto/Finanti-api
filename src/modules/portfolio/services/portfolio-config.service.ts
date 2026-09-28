@@ -27,6 +27,9 @@ export class PortfolioConfigService {
           baseRegraCustom: dto.baseRegraCustom,
           tipoRankingRecomendacao: dto.tipoRankingRecomendacao ?? 'setor',
           permiteFracionario: dto.permiteFracionario ?? true,
+          rebalanceToleranceMode: dto.rebalanceToleranceMode ?? 'FIXED',
+          dynamicMaxAdjustment: dto.dynamicMaxAdjustment ?? 2,
+          dynamicGuardrailEnabled: dto.dynamicGuardrailEnabled ?? true,
         },
         update: {
           percentualRendaFixa: dto.percentualRendaFixa,
@@ -37,6 +40,9 @@ export class PortfolioConfigService {
           baseRegraCustom: dto.baseRegraCustom ?? null,
           tipoRankingRecomendacao: dto.tipoRankingRecomendacao ?? 'setor',
           permiteFracionario: dto.permiteFracionario ?? true,
+          rebalanceToleranceMode: dto.rebalanceToleranceMode ?? 'FIXED',
+          dynamicMaxAdjustment: dto.dynamicMaxAdjustment ?? 2,
+          dynamicGuardrailEnabled: dto.dynamicGuardrailEnabled ?? true,
         },
       });
 
