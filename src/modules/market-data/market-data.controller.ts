@@ -72,6 +72,21 @@ export class MarketDataController {
     return this.ranking.getRanking(tipoGrupo, nomeGrupo, anoMes);
   }
 
+  /**
+   * Auditoria indicador-por-indicador (valor bruto + normalizado individual + scores compostos)
+   * — pra investigar erros de pontuação sem precisar recalcular nada manualmente. `nomeGrupo`
+   * obrigatório aqui (diferente de /ranking, que aceita omitir pra listar tudo) — descubra os
+   * valores válidos via GET /market-data/grupos?tipoGrupo=&anoMes=.
+   */
+  @Get('ranking-detalhado')
+  async getRankingDetalhado(
+    @Query('tipoGrupo') tipoGrupo: string,
+    @Query('nomeGrupo') nomeGrupo: string,
+    @Query('anoMes') anoMes: string,
+  ) {
+    return this.ranking.getRankingDetalhado(tipoGrupo, nomeGrupo, anoMes);
+  }
+
   @Get('ranking-hibrido')
   async getRankingHibrido(@Query('anoMes') anoMes: string) {
     return this.ranking.getRankingHibrido(anoMes);

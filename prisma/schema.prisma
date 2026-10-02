@@ -26,6 +26,7 @@ model User {
   portfolioConfig     PortfolioConfig?
   investimentos       Investimento[]
   transacoesSimulacao TransacaoSimulacao[]
+  vendasInvestimentos VendaInvestimento[]
   simulacaoConfig     SimulacaoConfig?
   historicoCarteira   HistoricoCarteira[]
   operacoesFiscais    OperacaoFiscal[]
@@ -338,6 +339,28 @@ model Investimento {
 
   @@index([userId, carteira])
   @@map("investimentos")
+}
+
+/// Histórico de vendas da carteira REAL. A posição Investimento guarda apenas o saldo atual;
+/// este ledger preserva o preço de execução e o ganho apurado pela base de custo médio no momento.
+model VendaInvestimento {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  tipo           String // "acao" | "fii" | "renda_fixa"
+  ticker         String?
+  nome           String
+  quantidade     Float
+  precoUnitario  Float
+  valor          Float // quantidade * precoUnitario, antes dos custos
+  custos         Float @default(0)
+  ganhoRealizado Float // valor - custos - quantidade * precoMedio da posição no momento da venda
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("vendas_investimentos")
 }
 
 /// Log de auditoria de cada mutação aplicada à carteira de simulação (venda/compra, disparada

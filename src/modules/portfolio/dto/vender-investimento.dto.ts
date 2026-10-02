@@ -5,14 +5,10 @@ export class VenderInvestimentoDto {
   @Min(0.0001)
   quantidade: number;
 
-  /** Só lido na venda da carteira REAL (PortfolioController.venderInvestimento). Uma venda nunca
-   * é ambígua (é sempre uma operação de hoje) — se vier preenchido, a venda é automaticamente
-   * espelhada como uma OperacaoFiscal ('venda'); se omitido, comportamento antigo (sem fiscal).
-   * Ver docs/FEATURE_SPEC_FISCAL.md seção 2. */
-  @IsOptional()
+  /** Preço unitário efetivo da venda. Obrigatório para calcular e registrar o ganho realizado. */
   @IsNumber()
-  @Min(0)
-  precoVenda?: number;
+  @Min(0.0001)
+  precoVenda: number;
 
   /** Corretagem/emolumentos da venda, pra registrarFiscal. Default 0. */
   @IsOptional()

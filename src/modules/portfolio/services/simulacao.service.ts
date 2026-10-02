@@ -302,13 +302,15 @@ export class SimulacaoService {
   }
 
   /**
-   * Aplica o aporte acumulado desde a última aplicação (ou desde o início da simulação, se
-   * nunca aplicado), direcionando pro(s) setor(es) mais subalocado(s) — mesmo rateio
-   * proporcional a scorePreco usado em getRecomendacoes (ver
-   * InvestimentoService.calcularValorCompraPorSetor). Sem setor subalocado (carteira já
-   * equilibrada), rateia proporcional ao valor atual de cada setor em vez de travar o aporte.
+   * Aplica o aporte acumulado desde a última aplicação (ou desde o início da simulação, se nunca
+   * aplicado) — credita direto em `caixaDisponivel`, NÃO compra nada sozinho (correção pedida
+   * pelo usuário 2026-09-30: aporte semanal diluía automaticamente entre setores subalocados,
+   * o mesmo rateio de `getRecomendacoes`; agora só acumula caixa, exatamente como o produto de
+   * uma venda sem par — quem decide o que comprar com esse dinheiro é o usuário via "Investir
+   * caixa" ou uma Next Best Action do motor novo). `anoMes` não é mais usado aqui (não compra
+   * nada, não precisa de cotação) — mantido só pra não quebrar a rota que já o recebe.
    */
-  async aplicarAporteSemanal(userId: string, anoMes: string) {
+  async aplicarAporteSemanal(userId: string, _anoMes: string) {
     const config = await this.prisma.simulacaoConfig.findUnique({ where: { userId } });
     if (!config || config.aporteSemanalValor <= 0) {
       throw new BadRequestException('Configure um valor de aporte semanal antes de aplicar.');
@@ -317,41 +319,14 @@ export class SimulacaoService {
     const dataBase = config.ultimoAporteAplicadoEm ?? config.simulacaoIniciadaEm ?? new Date();
     const diasDesde = (Date.now() - dataBase.getTime()) / (1000 * 60 * 60 * 24);
     const semanas = Math.floor(diasDesde / 7);
-    if (semanas <= 0) return { semanasAplicadas: 0, transacoes: [] };
+    if (semanas <= 0) return { semanasAplicadas: 0, valorAportado: 0 };
 
     const valorTotalAporte = semanas * config.aporteSemanalValor;
-    const planoDeCompra = await this.prepararPlanoDeAporte(userId, anoMes, valorTotalAporte);
-    const portfolioConfig = await this.prisma.portfolioConfig.findUnique({ where: { userId }, select: { permiteFracionario: true } });
-    const permiteFracionario = portfolioConfig?.permiteFracionario ?? true;
-
-    return this.prisma.$transaction(
-      async (tx) => {
-        const transacoes: TransacaoSimulacao[] = [];
-        let sobraTotal = 0;
-        for (const item of planoDeCompra) {
-          const { transacao, sobra } = await this.comprarOuReforcar(
-            tx,
-            userId,
-            item.ticker,
-            item.valor,
-            item.cotacao,
-            anoMes,
-            'aporte_semanal',
-            `Aporte semanal (${semanas} semana(s))`,
-            permiteFracionario,
-          );
-          if (transacao) transacoes.push(transacao);
-          sobraTotal += sobra; // arredondamento em lote (ver arredondarParaLote) — sobra vira caixa em vez de sumir
-        }
-
-        await tx.simulacaoConfig.update({
-          where: { userId },
-          data: { ultimoAporteAplicadoEm: new Date(), ...(sobraTotal > 0 ? { caixaDisponivel: { increment: sobraTotal } } : {}) },
-        });
-        return { semanasAplicadas: semanas, transacoes };
-      },
-      { timeout: 20000 },
-    );
+    const atualizado = await this.prisma.simulacaoConfig.update({
+      where: { userId },
+      data: { ultimoAporteAplicadoEm: new Date(), caixaDisponivel: { increment: valorTotalAporte } },
+    });
+    return { semanasAplicadas: semanas, valorAportado: valorTotalAporte, caixaDisponivel: atualizado.caixaDisponivel };
   }
 
   /**
@@ -517,11 +492,11 @@ export class SimulacaoService {
   }
 
   /**
-   * Compra/reforço a partir de um `PortfolioMove` do motor novo (Next Best Action) — mesmo
-   * mecanismo de `comprarOuReforcar` (lote, cotação do mês, reforço/criação, débito de caixa),
-   * só que abrindo sua PRÓPRIA `$transaction` (o método privado espera um `tx` já aberto pelos
-   * fluxos antigos de aporte semanal/investir caixa). Sobra do arredondamento vira caixa, nunca
-   * desaparece (mesmo tratamento dos outros fluxos de compra).
+  * Compra/reforço a partir de um `PortfolioMove` do motor novo (Next Best Action) — mesmo
+  * mecanismo de `comprarOuReforcar` (lote, cotação do mês, reforço/criação), só que abrindo sua
+  * PRÓPRIA `$transaction` (o método privado espera um `tx` já aberto pelos fluxos antigos de
+  * aporte semanal/investir caixa). O valor efetivamente comprado é debitado atomicamente do caixa;
+  * a sobra do arredondamento permanece nele.
    */
   async executarCompraDoMotor(userId: string, ticker: string, valorAporte: number, anoMes: string, idempotencyKey?: string): Promise<{ transacao: TransacaoSimulacao | null; sobra: number }> {
     const cotacao = await this.buscarCotacao(ticker, anoMes);
@@ -532,13 +507,22 @@ export class SimulacaoService {
     const permiteFracionario = portfolioConfig?.permiteFracionario ?? true;
 
     return this.prisma.$transaction(async (tx) => {
+      const config = await tx.simulacaoConfig.findUnique({ where: { userId } });
+      if (!config || config.caixaDisponivel <= 0) {
+        throw new BadRequestException('Não há caixa disponível pra executar essa compra.');
+      }
+
       const { transacao, sobra } = await this.comprarOuReforcar(tx, userId, ticker, valorAporte, cotacao, anoMes, 'motor', null, permiteFracionario, undefined, idempotencyKey);
-      if (sobra > 0) {
-        await tx.simulacaoConfig.upsert({
-          where: { userId },
-          update: { caixaDisponivel: { increment: sobra } },
-          create: { userId, caixaDisponivel: sobra },
+      if (transacao) {
+        // updateMany com condição de saldo evita caixa negativo inclusive se outra execução
+        // consumir o saldo entre a leitura e o débito. O custo é o valor real após arredondar o lote.
+        const debito = await tx.simulacaoConfig.updateMany({
+          where: { userId, caixaDisponivel: { gte: transacao.valor } },
+          data: { caixaDisponivel: { decrement: transacao.valor } },
         });
+        if (debito.count !== 1) {
+          throw new BadRequestException('Caixa disponível insuficiente para executar essa compra.');
+        }
       }
       return { transacao, sobra };
     });

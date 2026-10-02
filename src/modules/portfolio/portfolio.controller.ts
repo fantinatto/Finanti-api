@@ -108,11 +108,17 @@ export class PortfolioController {
     // Buscado ANTES de vender() — vender() pode deletar a linha (posição zerada), e o ticker/tipo
     // fazem falta pra montar a OperacaoFiscal depois.
     const antes = await this.investimentos.garantirDono(userId, id, 'real');
-    const resultado = await this.investimentos.vender(userId, id, dto.quantidade);
+    const resultado = await this.investimentos.vender(
+      userId,
+      id,
+      dto.quantidade,
+      dto.precoVenda,
+      dto.custosFiscais ?? 0,
+    );
 
     // Diferente da criação, uma venda nunca é ambígua (é sempre uma operação de hoje) — registra
     // no fiscal automaticamente sempre que vier um preço, sem precisar de confirmação extra.
-    if (dto.precoVenda != null && antes.tipo !== 'renda_fixa' && antes.ticker) {
+    if (antes.tipo !== 'renda_fixa' && antes.ticker) {
       await this.fiscal.criar(userId, {
         data: new Date().toISOString().slice(0, 10),
         ticker: antes.ticker,
@@ -133,6 +139,11 @@ export class PortfolioController {
     const userId = req['user'].sub;
     await this.historicoCarteira.garantirSnapshotDoMes(userId, 'real', anoMes);
     return this.investimentos.calcularGanhos(userId, anoMes);
+  }
+
+  @Get('investimentos/ganho-realizado')
+  async getGanhoRealizadoInvestimentos(@Req() req: Request) {
+    return { ganhoRealizado: await this.investimentos.getGanhoRealizado(req['user'].sub) };
   }
 
   @Get('investimentos/recomendacoes')

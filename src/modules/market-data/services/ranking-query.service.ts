@@ -144,6 +144,59 @@ export class RankingQueryService {
   }
 
   /**
+   * Auditoria completa do ranking, indicador por indicador — o que getRanking() NUNCA expôs (só
+   * os scores compostos). Pra cada ticker do grupo: valor bruto (IndicadorMensal), valor
+   * normalizado individual de CADA indicador (`*_norm`, ScoreNormalizado) e os scores compostos —
+   * dá pra conferir manualmente `bruto / média = norm` (ou `média / bruto`, conforme a direção)
+   * sem precisar recalcular nada. Sempre lê o `ScoreNormalizado` RAW do tier pedido (nunca aplica
+   * o fallback de amostra pequena do modo "segmento" puro — aqui o ponto é auditar exatamente o
+   * que está persistido naquele tier, não a versão "inteligente" que o ranking exibe).
+   */
+  async getRankingDetalhado(tipoGrupo: string, nomeGrupo: string, anoMes: string) {
+    const scores = await this.prisma.scoreNormalizado.findMany({
+      where: { tipoGrupo, nomeGrupo, anoMes },
+      include: { acao: { select: { nome: true, setor: true, segmento: true } } },
+      orderBy: { ticker: 'asc' },
+    });
+    if (!scores.length) return [];
+
+    const tickers = scores.map((s) => s.ticker);
+    const brutos = await this.prisma.indicadorMensal.findMany({ where: { anoMes, ticker: { in: tickers } } });
+    const brutoPorTicker = new Map(brutos.map((b) => [b.ticker, b]));
+
+    return scores.map((s) => {
+      const bruto = brutoPorTicker.get(s.ticker);
+      return {
+        ticker: s.ticker,
+        nome: s.acao.nome,
+        setor: s.acao.setor,
+        segmento: s.acao.segmento,
+        bruto: bruto && {
+          pl: bruto.pl, pvp: bruto.pvp, pEbit: bruto.pEbit,
+          roe: bruto.roe, roic: bruto.roic, roa: bruto.roa,
+          margemBruta: bruto.margemBruta, margemEbit: bruto.margemEbit, margemLiquida: bruto.margemLiquida,
+          dy: bruto.dy,
+          dividaLiquidaPatrimonio: bruto.dividaLiquidaPatrimonio, dividaLiquidaEbitda: bruto.dividaLiquidaEbitda,
+          cagrReceita5a: bruto.cagrReceita5a, cagrLucro5a: bruto.cagrLucro5a,
+        },
+        normalizado: {
+          pl_norm: s.pl_norm, pvp_norm: s.pvp_norm, pEbit_norm: s.pEbit_norm,
+          roe_norm: s.roe_norm, roic_norm: s.roic_norm, roa_norm: s.roa_norm,
+          margemBruta_norm: s.margemBruta_norm, margemEbit_norm: s.margemEbit_norm, margemLiquida_norm: s.margemLiquida_norm,
+          dy_norm: s.dy_norm,
+          dividaLiquidaPatrimonio_norm: s.dividaLiquidaPatrimonio_norm, dividaLiquidaEbitda_norm: s.dividaLiquidaEbitda_norm,
+          cagrReceita5a_norm: s.cagrReceita5a_norm, cagrLucro5a_norm: s.cagrLucro5a_norm,
+        },
+        scores: {
+          scoreQualidade: s.scoreQualidade, scoreRisco: s.scoreRisco, scorePreco: s.scorePreco, scoreFinal: s.scoreFinal,
+          qualidadeDelta: s.qualidadeDelta, riscoDelta: s.riscoDelta, riscoComposto: s.riscoComposto,
+          precoDelta: s.precoDelta, scoreFinalDelta: s.scoreFinalDelta,
+        },
+      };
+    });
+  }
+
+  /**
    * Score de cada ticker no tier 'segmento', com fallback pro tier 'setor' quando o segmento
    * tem menos de QTD_MINIMA_SEGMENTO comparáveis (ver o comentário na constante). Base tanto do
    * modo "segmento" puro em getRanking() quanto de tipoRankingRecomendacao='segmento' em
@@ -208,8 +261,8 @@ export class RankingQueryService {
    * valor inventado).
    */
   async getRankingHibrido(anoMes: string) {
-    const PESO_SETOR = 0.6;
-    const PESO_SEGMENTO = 0.3;
+    const PESO_SETOR = 0.8;
+    const PESO_SEGMENTO = 0.1;
     const PESO_GERAL = 0.1;
 
     const [setorRows, segmentoRows, geralRows] = await Promise.all([

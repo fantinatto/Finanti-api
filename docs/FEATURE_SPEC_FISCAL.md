@@ -103,18 +103,17 @@ implicação fiscal) e **edição de posição (`atualizar`) continua sem gerar 
   posição antiga já possuída, e logar isso como uma compra de hoje sujaria a apuração fiscal com
   uma data errada. Frontend: checkbox "Também registrar essa compra no Fiscal" (pré-marcado,
   default `true`) + campos de data/custos, visível só na criação (não na edição) de ação/FII.
-- **Vender (`POST /portfolio/investimentos/:id/vender`)** — `VenderInvestimentoDto` ganhou
-  `precoVenda` (opcional) e `custosFiscais` (opcional). Diferente da criação, uma venda **nunca é
-  ambígua** (é sempre uma operação acontecendo agora) — se vier um `precoVenda`, o controller
-  registra automaticamente uma `OperacaoFiscal` (`tipo: 'venda'`), sem precisar de checkbox.
-  Frontend: o fluxo de venda (`window.prompt`) ganhou um segundo prompt pedindo o preço de venda,
-  opcional — em branco, comportamento antigo (sem fiscal).
+- **Vender (`POST /portfolio/investimentos/:id/vender`)** — `VenderInvestimentoDto` exige
+  `precoVenda` (preço unitário efetivo) e aceita `custosFiscais` (opcional). O backend registra
+  atomicamente o histórico de venda e atualiza/remove a posição; o ganho realizado é
+  `quantidade × precoVenda − custosFiscais − quantidade × precoMedio`. Para ação/FII, a operação
+  também é registrada automaticamente no livro fiscal. O total acumulado fica disponível em
+  `GET /portfolio/investimentos/ganho-realizado`.
 - `PortfolioModule` importa `FiscalModule` (que agora exporta `FiscalService`) pra o controller
   poder injetar os dois lados.
-- Validado com script standalone: criar com `registrarFiscal=true` gerou a `OperacaoFiscal`
-  esperada; criar sem a flag não gerou nenhuma; vender com `precoVenda` gerou a operação de
-  venda correta e manteve a posição restante íntegra; vender sem `precoVenda` não gerou operação
-  nova (comportamento antigo preservado).
+- Validação original: criar com `registrarFiscal=true` gerou a `OperacaoFiscal` esperada; criar
+  sem a flag não gerou nenhuma; venda com preço gerou a operação fiscal correta e preservou a
+  posição restante. O registro de vendas reais e o ganho realizado são detalhados acima.
 
 ### Frontend
 - **`src/app/interfaces/fiscal.interfaces.ts`**, **`src/app/services/fiscal.service.ts`**

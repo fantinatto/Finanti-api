@@ -224,17 +224,33 @@ export class InvestimentoService {
     return this.prisma.investimento.findMany({ where: { userId, carteira }, orderBy: { createdAt: 'asc' } });
   }
 
+  /**
+   * Bug real reportado pelo usuário (2026-10-01): comprar um ticker que já existe na carteira
+   * criava uma linha NOVA (duplicada) em vez de somar quantidade e recalcular o preço médio
+   * ponderado — mesmo bug já corrigido em `SimulacaoService.criar` em 2026-09-25 (ver memória),
+   * mas lá o escopo tinha ficado deliberadamente restrito à Simulação. Mesmo mecanismo aqui:
+   * busca um `Investimento` existente (mesmo userId+carteira+tipo+ticker) antes de gravar — se
+   * existir, reforça; senão cria. `ticker: null` (renda fixa) nunca reforça — cada entrada é uma
+   * posição de renda fixa própria, não "a mesma renda fixa de novo".
+   */
   async criar(userId: string, dto: UpsertInvestimentoDto, carteira: TipoCarteira = CARTEIRA_PADRAO) {
-    return this.prisma.investimento.create({
-      data: {
-        userId,
-        carteira,
-        tipo: dto.tipo,
-        ticker: dto.tipo === 'renda_fixa' ? null : (dto.ticker?.toUpperCase() ?? null),
-        nome: dto.nome,
-        precoMedio: dto.precoMedio,
-        quantidade: dto.quantidade,
-      },
+    const ticker = dto.tipo === 'renda_fixa' ? null : (dto.ticker?.toUpperCase() ?? null);
+
+    return this.prisma.$transaction(async (tx) => {
+      const existente = ticker ? await tx.investimento.findFirst({ where: { userId, carteira, tipo: dto.tipo, ticker } }) : null;
+
+      if (existente) {
+        const novaQuantidade = existente.quantidade + dto.quantidade;
+        const novoPrecoMedio = (existente.quantidade * existente.precoMedio + dto.quantidade * dto.precoMedio) / novaQuantidade;
+        return tx.investimento.update({
+          where: { id: existente.id },
+          data: { quantidade: novaQuantidade, precoMedio: novoPrecoMedio },
+        });
+      }
+
+      return tx.investimento.create({
+        data: { userId, carteira, tipo: dto.tipo, ticker, nome: dto.nome, precoMedio: dto.precoMedio, quantidade: dto.quantidade },
+      });
     });
   }
 
@@ -258,29 +274,63 @@ export class InvestimentoService {
   }
 
   /**
-   * Registra uma venda parcial/total na carteira REAL — só ajusta a quantidade (precoMedio do
-   * que sobra não muda, vender não altera o custo médio das ações restantes). Sem histórico de
-   * transação/ganho realizado: a carteira real é uma ficha manual do que o usuário possui hoje,
-   * não um livro-razão. Zera a posição (remove a linha) se a quantidade vendida cobrir o total.
-   * Simulação usa SimulacaoService.venderManual em vez deste método — lá uma venda precisa
-   * gerar TransacaoSimulacao/ganhoRealizado/caixa pra não ficar inconsistente com o que
-   * executarRecomendacao já registra.
+   * Registra uma venda parcial/total e preserva seu resultado realizado. O custo da venda é
+   * calculado pelo precoMedio da posição antes de alterar a quantidade. A escrita do histórico e
+   * da posição é atômica; o custo médio remanescente não muda.
    */
-  async vender(userId: string, id: string, quantidade: number, carteira: TipoCarteira = CARTEIRA_PADRAO) {
+  async vender(
+    userId: string,
+    id: string,
+    quantidade: number,
+    precoVenda: number,
+    custos: number,
+    carteira: TipoCarteira = CARTEIRA_PADRAO,
+  ) {
     const inv = await this.garantirDono(userId, id, carteira);
     if (quantidade <= 0) {
       throw new BadRequestException('Quantidade a vender precisa ser maior que zero.');
+    }
+    if (precoVenda <= 0) {
+      throw new BadRequestException('O preço de venda precisa ser maior que zero.');
     }
     if (quantidade > inv.quantidade + 0.0001) {
       throw new BadRequestException(`Você só possui ${inv.quantidade} unidades — não é possível vender ${quantidade}.`);
     }
 
     const restante = inv.quantidade - quantidade;
-    if (restante <= 0.0001) {
-      await this.prisma.investimento.delete({ where: { id } });
-      return null;
-    }
-    return this.prisma.investimento.update({ where: { id }, data: { quantidade: restante } });
+    const valor = quantidade * precoVenda;
+    const ganhoRealizado = valor - custos - quantidade * inv.precoMedio;
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.vendaInvestimento.create({
+        data: {
+          userId,
+          tipo: inv.tipo,
+          ticker: inv.ticker,
+          nome: inv.nome,
+          quantidade,
+          precoUnitario: precoVenda,
+          valor,
+          custos,
+          ganhoRealizado,
+        },
+      });
+
+      if (restante <= 0.0001) {
+        await tx.investimento.delete({ where: { id } });
+        return null;
+      }
+      return tx.investimento.update({ where: { id }, data: { quantidade: restante } });
+    });
+  }
+
+  /** Soma o lucro/prejuízo líquido de todas as vendas reais registradas. */
+  async getGanhoRealizado(userId: string): Promise<number> {
+    const resultado = await this.prisma.vendaInvestimento.aggregate({
+      where: { userId },
+      _sum: { ganhoRealizado: true },
+    });
+    return resultado._sum.ganhoRealizado ?? 0;
   }
 
   /**

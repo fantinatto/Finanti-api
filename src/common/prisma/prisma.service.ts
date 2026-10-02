@@ -102,6 +102,10 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     return this.prisma.investimento;
   }
 
+  get vendaInvestimento() {
+    return this.prisma.vendaInvestimento;
+  }
+
   get transacaoSimulacao() {
     return this.prisma.transacaoSimulacao;
   }

@@ -29,7 +29,7 @@ export const SETOR_PESOS_CONFIG: Record<string, SectorWeightConfig> = {
   // Segmento (não o setor "Financeiro e Outros" inteiro, que também tem seguradoras e
   // corretoras): ROIC e Dívida Líq./EBITDA não fazem sentido pro negócio de captar/emprestar
   // — peso 0 explícito em vez do hack de nulificar o indicador na ingestão.
-  Bancos: {
+  'Financeiro e Outros': {
     qualidade: { roe: 0.50, roic: 0.00, margemBruta: 0.00, margemLiquida: 0.30, cagrReceita5a: 0.10, cagrLucro5a: 0.10 },
     risco: { dividaLiquidaPatrimonio: 1.00, dividaLiquidaEbitda: 0.00 },
     preco: { pl: 0.45, pvp: 0.45, dy: 0.10, pEbit: 0.00 },
