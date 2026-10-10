@@ -17,11 +17,20 @@ const BRAPI_V2_BASE_URL = 'https://brapi.dev/api/v2';
 // Se o plano for atualizado para permitir mais ativos por requisição, subir esse valor.
 const BATCH_SIZE = 1;
 const MODULES = 'summaryProfile,defaultKeyStatistics,financialData';
+// Catálogo de FIIs (ticker+nome+cotação) é estático dentro do dia — não tem fundamento nenhum
+// pra justificar refetch a cada autocomplete. 6h é só pra não ficar com dado de fechamento muito
+// velho, não por risco de a LISTA de FIIs mudar nesse intervalo.
+const CACHE_FIIS_TTL_MS = 6 * 60 * 60 * 1000;
 
 @Injectable()
 export class BrapiService {
   private readonly logger = new Logger(BrapiService.name);
   private readonly token: string;
+
+  // Cache isolado da busca de FII — nenhum outro método deste service lê/escreve nesses campos,
+  // pra não arriscar efeito colateral no fluxo de ações (buscarFundamentais/listarTickers).
+  private cacheFiis: { ticker: string; nome: string; precoFechamento: number | null }[] | null = null;
+  private cacheFiisExpiraEm = 0;
 
   constructor(
     private readonly http: HttpService,
@@ -34,6 +43,53 @@ export class BrapiService {
     const url = `${BRAPI_BASE_URL}/quote/list?token=${this.token}`;
     const resp = await firstValueFrom(this.http.get<BrapiListResponse>(url));
     return resp.data.stocks;
+  }
+
+  /**
+   * Search-help pro campo Ticker quando `tipo==='fii'` — caminho 100% separado de
+   * `buscarTickers`/Acao (ranking-query.service.ts): não existe ingestão de fundamentos de FII
+   * hoje (ver análise de complexidade), então isso é só um catálogo ticker+cotação vindo da
+   * listagem pública da brapi (`quote/list?type=fund`), sem nome amigável (a API devolve o
+   * próprio ticker como `name` pra fundos) e sem histórico mensal (`anoMes` sempre null).
+   */
+  async buscarTickersFii(
+    query: string,
+  ): Promise<{ ticker: string; nome: string; precoFechamento: number | null; anoMes: string | null }[]> {
+    const termo = query.trim();
+    if (termo.length < 1) return [];
+
+    const fiis = await this.obterCatalogoFiis();
+    const termoUpper = termo.toUpperCase();
+    const encontrados = fiis.filter((f) => f.ticker.includes(termoUpper));
+
+    encontrados.sort((a, b) => {
+      const prioridadeA = a.ticker.startsWith(termoUpper) ? 0 : 1;
+      const prioridadeB = b.ticker.startsWith(termoUpper) ? 0 : 1;
+      return prioridadeA !== prioridadeB ? prioridadeA - prioridadeB : a.ticker.localeCompare(b.ticker);
+    });
+
+    return encontrados.slice(0, 15).map((f) => ({ ...f, anoMes: null }));
+  }
+
+  private async obterCatalogoFiis(): Promise<{ ticker: string; nome: string; precoFechamento: number | null }[]> {
+    if (this.cacheFiis && Date.now() < this.cacheFiisExpiraEm) {
+      return this.cacheFiis;
+    }
+
+    const url = `${BRAPI_BASE_URL}/quote/list?token=${this.token}&type=fund&limit=1000`;
+    try {
+      const resp = await firstValueFrom(this.http.get<BrapiListResponse>(url));
+      const catalogo = resp.data.stocks
+        .filter((item) => item.subType === 'fii')
+        .map((item) => ({ ticker: item.stock, nome: item.name, precoFechamento: item.close ?? null }));
+
+      this.cacheFiis = catalogo;
+      this.cacheFiisExpiraEm = Date.now() + CACHE_FIIS_TTL_MS;
+      return catalogo;
+    } catch (err: any) {
+      this.logger.error(`Falha ao buscar catálogo de FIIs: ${err?.response?.status ?? ''} ${(err as Error).message}`);
+      return this.cacheFiis ?? []; // dado velho é melhor que quebrar o autocomplete
+    }
   }
 
   async previewTicker(ticker: string): Promise<unknown> {

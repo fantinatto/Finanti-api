@@ -1,5 +1,7 @@
 import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { IngestionService } from './services/ingestion.service';
+import { IngestionFiiService } from './services/ingestion-fii.service';
+import { FiiRankingService } from './services/fii-ranking.service';
 import { RankingQueryService } from './services/ranking-query.service';
 import { BrapiService } from './services/brapi.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -11,6 +13,8 @@ import { FILTROS_AVANCADOS_CONFIG, FILTROS_FIXOS_CONFIG } from './filtro-avancad
 export class MarketDataController {
   constructor(
     private readonly ingestion: IngestionService,
+    private readonly ingestionFii: IngestionFiiService,
+    private readonly fiiRanking: FiiRankingService,
     private readonly ranking: RankingQueryService,
     private readonly brapi: BrapiService,
   ) {}
@@ -18,6 +22,37 @@ export class MarketDataController {
   @Post('ingest')
   async ingerir(@Body() filtro: IngestionFiltroDto = {}) {
     return this.ingestion.executar(filtro);
+  }
+
+  // Rotas de FII — serviço/tabelas 100% separados da coleta de ações (ver IngestionFiiService).
+  @Post('ingest-fii')
+  async ingerirFii() {
+    return this.ingestionFii.executar();
+  }
+
+  @Get('meses-fii')
+  async getMesesFii() {
+    return this.ingestionFii.getMeses();
+  }
+
+  @Get('indicadores-fii')
+  async getIndicadoresFii(@Query('anoMes') anoMes: string) {
+    return this.ingestionFii.getIndicadores(anoMes);
+  }
+
+  @Get('resumo-fii')
+  async getResumoFii(@Query('anoMes') anoMes: string) {
+    return this.ingestionFii.getResumo(anoMes);
+  }
+
+  @Get('segmentos-fii')
+  async getSegmentosFii() {
+    return this.ingestionFii.getSegmentos();
+  }
+
+  @Get('ranking-fii')
+  async getRankingFii(@Query('anoMes') anoMes: string) {
+    return this.fiiRanking.getRanking(anoMes);
   }
 
   @Get('filtros-avancados')
@@ -61,6 +96,13 @@ export class MarketDataController {
   @Get('tickers')
   async buscarTickers(@Query('q') q: string) {
     return this.ranking.buscarTickers(q ?? '');
+  }
+
+  // Rota separada de 'tickers' (ações) — fonte de dado e cache são 100% isolados em BrapiService,
+  // ver comentário de buscarTickersFii.
+  @Get('tickers-fii')
+  async buscarTickersFii(@Query('q') q: string) {
+    return this.brapi.buscarTickersFii(q ?? '');
   }
 
   @Get('ranking')

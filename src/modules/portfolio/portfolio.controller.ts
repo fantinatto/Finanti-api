@@ -6,6 +6,8 @@ import { PortfolioConfigService } from './services/portfolio-config.service';
 import { RebalancingRuleService } from './services/rebalancing-rule.service';
 import { InvestimentoService } from './services/investimento.service';
 import type { TipoCarteira } from './services/investimento.service';
+import { RendaFixaService } from './services/renda-fixa.service';
+import type { CenarioSimulacao } from './services/renda-fixa.service';
 import { SimulacaoService } from './services/simulacao.service';
 import { HistoricoCarteiraService } from './services/historico-carteira.service';
 import { FiscalService } from '../fiscal/services/fiscal.service';
@@ -15,6 +17,7 @@ import { UpsertInvestimentoDto } from './dto/upsert-investimento.dto';
 import { VenderInvestimentoDto } from './dto/vender-investimento.dto';
 import { UpsertSimulacaoConfigDto } from './dto/upsert-simulacao-config.dto';
 import { ExecutarNextBestActionDto } from './dto/executar-next-best-action.dto';
+import { SimularRendaFixaDto } from './dto/simular-renda-fixa.dto';
 import { BASES_REGRA_PADRAO, CONTRATO_DI_FIXO, TAXA_DI_FIXA } from './rebalancing.config';
 
 @Controller('portfolio')
@@ -25,6 +28,7 @@ export class PortfolioController {
     private readonly config: PortfolioConfigService,
     private readonly regras: RebalancingRuleService,
     private readonly investimentos: InvestimentoService,
+    private readonly rendaFixa: RendaFixaService,
     private readonly simulacao: SimulacaoService,
     private readonly historicoCarteira: HistoricoCarteiraService,
     private readonly fiscal: FiscalService,
@@ -65,6 +69,22 @@ export class PortfolioController {
   @Get('investimentos')
   async listarInvestimentos(@Req() req: Request) {
     return this.investimentos.listar(req['user'].sub);
+  }
+
+  /** Simulador "qual vale mais investir" — cenários ad-hoc, não precisam ser posições salvas. */
+  @Post('renda-fixa/simular')
+  simularRendaFixa(@Body() dto: SimularRendaFixaDto) {
+    const dataReferencia = dto.dataReferencia ? new Date(dto.dataReferencia) : new Date();
+    const cenarios: CenarioSimulacao[] = dto.cenarios.map((c) => ({
+      nome: c.nome,
+      valorInvestido: c.valorInvestido,
+      tipoRentabilidade: c.tipoRentabilidade,
+      percentualOuTaxa: c.percentualOuTaxa,
+      dataAplicacao: new Date(c.dataAplicacao),
+      dataVencimento: new Date(c.dataVencimento),
+      isentoIr: c.isentoIr ?? false,
+    }));
+    return this.rendaFixa.simular(cenarios, dataReferencia);
   }
 
   @Post('investimentos')
@@ -141,6 +161,16 @@ export class PortfolioController {
     return this.investimentos.calcularGanhos(userId, anoMes);
   }
 
+  @Get('investimentos/diversificacao')
+  async diversificacaoInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getDiversificacao(req['user'].sub, anoMes);
+  }
+
+  @Get('investimentos/resumo-diversificacao')
+  async resumoDiversificacaoInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getResumoDiversificacao(req['user'].sub, anoMes);
+  }
+
   @Get('investimentos/ganho-realizado')
   async getGanhoRealizadoInvestimentos(@Req() req: Request) {
     return { ganhoRealizado: await this.investimentos.getGanhoRealizado(req['user'].sub) };
@@ -151,9 +181,29 @@ export class PortfolioController {
     return this.investimentos.getRecomendacoes(req['user'].sub, anoMes);
   }
 
+  @Get('investimentos/recomendacoes-fii')
+  async recomendacoesFiiInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getRecomendacoesFii(req['user'].sub, anoMes);
+  }
+
   @Get('investimentos/balanceamento')
   async balanceamentoInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
     return this.investimentos.getBalanceamentoPorSetor(req['user'].sub, anoMes);
+  }
+
+  @Get('investimentos/balanceamento-fii')
+  async balanceamentoFiiInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getBalanceamentoPorSegmentoFii(req['user'].sub, anoMes);
+  }
+
+  @Get('investimentos/balanceamento-setor-fii')
+  async balanceamentoSetorFiiInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getBalanceamentoPorSetorFii(req['user'].sub, anoMes);
+  }
+
+  @Get('investimentos/saude-fii')
+  async saudeFiiInvestimentos(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getSaudeCarteiraFii(req['user'].sub, anoMes);
   }
 
   @Get('investimentos/saude')
@@ -245,6 +295,11 @@ export class PortfolioController {
     return this.investimentos.getRecomendacoes(req['user'].sub, anoMes, 'simulacao');
   }
 
+  @Get('simulacao/investimentos/recomendacoes-fii')
+  async recomendacoesFiiInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getRecomendacoesFii(req['user'].sub, anoMes, 'simulacao');
+  }
+
   /**
    * Preview do motor novo (Search Engine depth=3 + Decision Trace) — só leitura, nenhuma
    * mutação, deliberadamente PARALELO ao endpoint legado acima. Não substitui/chama
@@ -268,6 +323,16 @@ export class PortfolioController {
   @Get('simulacao/investimentos/balanceamento')
   async balanceamentoInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
     return this.investimentos.getBalanceamentoPorSetor(req['user'].sub, anoMes, 'simulacao');
+  }
+
+  @Get('simulacao/investimentos/balanceamento-fii')
+  async balanceamentoFiiInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getBalanceamentoPorSegmentoFii(req['user'].sub, anoMes, 'simulacao');
+  }
+
+  @Get('simulacao/investimentos/balanceamento-setor-fii')
+  async balanceamentoSetorFiiInvestimentosSimulacao(@Req() req: Request, @Query('anoMes') anoMes: string) {
+    return this.investimentos.getBalanceamentoPorSetorFii(req['user'].sub, anoMes, 'simulacao');
   }
 
   @Get('simulacao/investimentos/saude')

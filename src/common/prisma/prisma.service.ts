@@ -85,6 +85,15 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     return this.prisma.scoreNormalizado;
   }
 
+  // Models - Market Data (FII, pipeline separado — ver IngestionFiiService)
+  get fii() {
+    return this.prisma.fii;
+  }
+
+  get indicadorMensalFii() {
+    return this.prisma.indicadorMensalFii;
+  }
+
   // Models - Portfolio
   get portfolioConfig() {
     return this.prisma.portfolioConfig;
@@ -96,6 +105,10 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
 
   get alocacaoSegmentoFii() {
     return this.prisma.alocacaoSegmentoFii;
+  }
+
+  get alocacaoSetorFii() {
+    return this.prisma.alocacaoSetorFii;
   }
 
   get investimento() {
@@ -120,5 +133,17 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
 
   get operacaoFiscal() {
     return this.prisma.operacaoFiscal;
+  }
+
+  get gastoMensal() {
+    return this.prisma.gastoMensal;
+  }
+
+  get ganhoMensal() {
+    return this.prisma.ganhoMensal;
+  }
+
+  get rendaFixaDetalhe() {
+    return this.prisma.rendaFixaDetalhe;
   }
 }

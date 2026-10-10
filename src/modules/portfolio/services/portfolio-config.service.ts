@@ -9,7 +9,7 @@ export class PortfolioConfigService {
   async getConfig(userId: string) {
     return this.prisma.portfolioConfig.findUnique({
       where: { userId },
-      include: { alocacoesSetor: true, alocacoesSegmentoFii: true },
+      include: { alocacoesSetor: true, alocacoesSegmentoFii: true, alocacoesSetorFii: true },
     });
   }
 
@@ -49,6 +49,7 @@ export class PortfolioConfigService {
       // replace-all das alocações — mais simples que diff, e o volume é pequeno (poucas dezenas de linhas)
       await tx.alocacaoSetor.deleteMany({ where: { portfolioConfigId: config.id } });
       await tx.alocacaoSegmentoFii.deleteMany({ where: { portfolioConfigId: config.id } });
+      await tx.alocacaoSetorFii.deleteMany({ where: { portfolioConfigId: config.id } });
 
       if (dto.alocacoesSetor.length) {
         await tx.alocacaoSetor.createMany({
@@ -70,9 +71,19 @@ export class PortfolioConfigService {
         });
       }
 
+      if (dto.alocacoesSetorFii.length) {
+        await tx.alocacaoSetorFii.createMany({
+          data: dto.alocacoesSetorFii.map((a) => ({
+            portfolioConfigId: config.id,
+            setor: a.nome,
+            percentual: a.percentual,
+          })),
+        });
+      }
+
       return tx.portfolioConfig.findUniqueOrThrow({
         where: { id: config.id },
-        include: { alocacoesSetor: true, alocacoesSegmentoFii: true },
+        include: { alocacoesSetor: true, alocacoesSegmentoFii: true, alocacoesSetorFii: true },
       });
     });
   }

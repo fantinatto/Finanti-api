@@ -1,8 +1,10 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../../common/prisma/prisma.service';
 import { RankingQueryService } from '../../market-data/services/ranking-query.service';
+import { FiiRankingService } from '../../market-data/services/fii-ranking.service';
 import { UpsertInvestimentoDto } from '../dto/upsert-investimento.dto';
 import { arredondarParaLote, TAMANHO_FRACIONARIO, TAMANHO_LOTE } from './lote';
+import { RendaFixaService, TipoRentabilidadeRendaFixa } from './renda-fixa.service';
 
 /** "real" | "simulacao" — mesma tabela Investimento, carteiras isoladas por usuário. Usado em
  * todo método público deste service pra filtrar/gravar na carteira certa. */
@@ -47,6 +49,51 @@ export interface GanhoInvestimento {
   valorAtual: number | null;
   ganho: number | null;
   ganhoPercentual: number | null;
+  /** Setor (Acao.setor) pra tipo='acao', segmento (Fii.segmento) pra tipo='fii' — null pra
+   * renda_fixa (sem classificação) ou quando a fonte não tem o dado. Só pra exibição na tabela
+   * de /investimentos, não entra em nenhum cálculo de rebalanceamento/score. */
+  classificacao: string | null;
+}
+
+export interface FatiaDiversificacao {
+  chave: string;
+  valor: number;
+  percentual: number;
+}
+
+export interface DiversificacaoCarteira {
+  /// % entre Ações/FIIs/Renda Fixa, sobre o valor TOTAL da carteira.
+  macro: FatiaDiversificacao[];
+  /// % por setor, só dentro da fatia de Ações (soma 100% entre si, não do total da carteira).
+  porSetorAcao: FatiaDiversificacao[];
+  /// % por tipo de fundo (Fundo de Tijolo/Papel/Misto/etc, campo Fii.tipoFundo), só dentro da
+  /// fatia de FIIs.
+  porTipoFundoFii: FatiaDiversificacao[];
+}
+
+/** Espelha BalanceamentoSetor, mas pro macro (Ações/FIIs/Renda Fixa) — alvo vem de
+ * PortfolioConfig.percentual{RendaFixa,Acoes,Fiis} em vez de uma tabela de alocação dedicada
+ * (ver getResumoDiversificacao). Sempre as 3 chaves, mesmo com valor/alvo zero — diferente de
+ * DiversificacaoCarteira.macro, que omite fatia com valor zero (é só pro gráfico de composição). */
+export interface BalanceamentoMacro {
+  chave: string; // 'Ações' | 'FIIs' | 'Renda Fixa'
+  valorAtual: number;
+  percentualAtual: number;
+  percentualAlvo: number;
+  diferenca: number;
+  status: 'sobrealocado' | 'subalocado' | 'equilibrado';
+}
+
+export interface ResumoDiversificacao {
+  macro: BalanceamentoMacro[];
+  /** 100 − metade da soma das diferenças absolutas entre real e alvo macro — % do valor da
+   * carteira já alocado dentro da banda de tolerância do alvo configurado. 100 = perfeitamente
+   * alinhado (mesma lógica de "tracking error" de 2 pontas: cada real desvia do alvo em alguma
+   * direção, a métrica usa só a metade pra não contar o mesmo desvio duas vezes). */
+  percentualDiversificado: number;
+  /** Complemento de percentualDiversificado — % do valor da carteira que precisaria migrar
+   * entre Ações/FIIs/Renda Fixa pra bater o alvo configurado em Carteira. */
+  percentualFaltante: number;
 }
 
 /**
@@ -115,6 +162,38 @@ export interface RecomendacaoHolding {
   prioridade: PrioridadeAcao | null;
 }
 
+/**
+ * Espelha RecomendacaoHolding, mas pra FII — troca setor/scoreQualidade/scoreRisco/scorePreco
+ * pelos 4 pilares do FiiRankingService. Reusa CategoriaAcao/PrioridadeAcao como estão (ver
+ * getRecomendacoesFii) — a matriz de decisão é a mesma, só os dados de entrada mudam.
+ */
+export interface RecomendacaoHoldingFii {
+  id: string;
+  ticker: string;
+  nome: string;
+  segmento: string | null;
+  scoreFinal: number | null;
+  scoreValuation: number | null;
+  scoreRenda: number | null;
+  scoreLiquidezPorte: number | null;
+  scorePreservacao: number | null;
+  /** % que o segmento desse FII representa hoje dentro da fatia de FIIs da carteira. */
+  percentualReal: number | null;
+  /** % alvo configurada pra esse segmento em Carteira (AlocacaoSegmentoFii). Null se não configurado. */
+  percentualAlvo: number | null;
+  categoriaAcao: CategoriaAcao;
+  sugestaoTroca: { ticker: string; nome: string; scoreFinal: number | null } | null;
+  motivoTroca: string | null;
+  deltaScoreTroca: number | null;
+  sugestaoRebalanceamento: 'comprar' | 'vender' | null;
+  valorSugerido: number | null;
+  quantidadeSugerida: number | null;
+  prioridade: PrioridadeAcao | null;
+  /** 'desenvolvimento' | 'dividend_trap' | 'desenvolvimento+dividend_trap' | null — mesmo
+   * alerta já calculado em FiiRankingItem.alertaRisco, só repassado aqui. */
+  alertaRisco: string | null;
+}
+
 /** Fallback quando o usuário não configurou percentualEstouro em Carteira. */
 const PERCENTUAL_ESTOURO_PADRAO = 5;
 
@@ -162,6 +241,29 @@ export interface ContextoRebalanceamento {
   acoesPorSetor: Map<string, AcaoContextoSetor[]>;
 }
 
+/** Espelha AcaoContextoSetor, mas com os campos do ranking de FII usados na matriz de decisão:
+ * scoreLiquidezPorte faz o papel de "gate" de qualidade (ver calcularValorCompraPorSegmentoFii),
+ * scoreValuation o papel de peso proporcional (ver mapeamento ação→FII no plano). */
+interface FiiContextoSegmento {
+  id: string;
+  ticker: string;
+  scoreFinal: number | null;
+  scoreLiquidezPorte: number | null;
+  scoreValuation: number | null;
+}
+
+/** Espelha ContextoRebalanceamento, mas pra FII — agrupado por Segmento (decisão confirmada com
+ * o usuário em 2026-10-09: segmento tem o mesmo papel que Setor tem pra ação; tipo de fundo
+ * continua só no Balanceamento, fora do motor de recomendação). */
+export interface ContextoRebalanceamentoFii {
+  fiis: { id: string; ticker: string }[];
+  valorTotalFiis: number;
+  valorPorSegmento: Map<string, number>;
+  alocacoesAlvo: Map<string, number>;
+  percentualEstouro: number;
+  fiisPorSegmento: Map<string, FiiContextoSegmento[]>;
+}
+
 export interface BalanceamentoSetor {
   setor: string;
   valorAtual: number;
@@ -172,6 +274,31 @@ export interface BalanceamentoSetor {
   status: 'sobrealocado' | 'subalocado' | 'equilibrado';
   /** true quando o setor tem alvo configurado mas ZERO ações hoje — "setor descoberto". */
   semNenhumaAcao: boolean;
+}
+
+/** Espelha BalanceamentoSetor, mas pro segmento de atuação do FII (Fii.segmento — Shoppings,
+ * Lajes Corporativas, Logística, etc; ver getBalanceamentoPorSegmentoFii). */
+export interface BalanceamentoSegmentoFii {
+  segmento: string;
+  valorAtual: number;
+  percentualAtual: number;
+  percentualAlvo: number;
+  diferenca: number;
+  status: 'sobrealocado' | 'subalocado' | 'equilibrado';
+  semNenhumFii: boolean;
+}
+
+/** Espelha BalanceamentoSegmentoFii, mas pro "setor" de FII (Fii.tipoFundo — Fundo de
+ * Tijolo/Papel/Misto; ver getBalanceamentoPorSetorFii). Dimensão independente do segmento: um
+ * FII logístico (segmento) é um Fundo de Tijolo (setor), por exemplo. */
+export interface BalanceamentoSetorFii {
+  setor: string;
+  valorAtual: number;
+  percentualAtual: number;
+  percentualAlvo: number;
+  diferenca: number;
+  status: 'sobrealocado' | 'subalocado' | 'equilibrado';
+  semNenhumFii: boolean;
 }
 
 /**
@@ -193,6 +320,22 @@ export interface SaudeCarteira {
   pesoPreco: number;
   pesoFinal: number;
   valorTotalCarteira: number;
+}
+
+/** Espelha SaudeCarteira, mas pros 4 pilares do ranking de FII (FiiRankingService) em vez de
+ * Qualidade/Risco/Preço de ação — ver getSaudeCarteiraFii. */
+export interface SaudeCarteiraFii {
+  scoreValuationMedio: number | null;
+  scoreRendaMedio: number | null;
+  scoreLiquidezPorteMedio: number | null;
+  scorePreservacaoMedio: number | null;
+  scoreFinalMedio: number | null;
+  pesoValuation: number;
+  pesoRenda: number;
+  pesoLiquidezPorte: number;
+  pesoPreservacao: number;
+  pesoFinal: number;
+  valorTotalFiis: number;
 }
 
 /**
@@ -218,10 +361,16 @@ export class InvestimentoService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly rankingQuery: RankingQueryService,
+    private readonly fiiRanking: FiiRankingService,
+    private readonly rendaFixa: RendaFixaService,
   ) {}
 
   async listar(userId: string, carteira: TipoCarteira = CARTEIRA_PADRAO) {
-    return this.prisma.investimento.findMany({ where: { userId, carteira }, orderBy: { createdAt: 'asc' } });
+    return this.prisma.investimento.findMany({
+      where: { userId, carteira },
+      orderBy: { createdAt: 'asc' },
+      include: { rendaFixaDetalhe: true },
+    });
   }
 
   /**
@@ -235,8 +384,11 @@ export class InvestimentoService {
    */
   async criar(userId: string, dto: UpsertInvestimentoDto, carteira: TipoCarteira = CARTEIRA_PADRAO) {
     const ticker = dto.tipo === 'renda_fixa' ? null : (dto.ticker?.toUpperCase() ?? null);
+    const rendaFixaData = this.paraDadosRendaFixa(dto);
 
     return this.prisma.$transaction(async (tx) => {
+      // Renda fixa nunca reforça posição existente (ver comentário da função) — só ação/FII
+      // chegam a este bloco de reforço, então rendaFixaData nunca precisa entrar aqui.
       const existente = ticker ? await tx.investimento.findFirst({ where: { userId, carteira, tipo: dto.tipo, ticker } }) : null;
 
       if (existente) {
@@ -249,14 +401,25 @@ export class InvestimentoService {
       }
 
       return tx.investimento.create({
-        data: { userId, carteira, tipo: dto.tipo, ticker, nome: dto.nome, precoMedio: dto.precoMedio, quantidade: dto.quantidade },
+        data: {
+          userId,
+          carteira,
+          tipo: dto.tipo,
+          ticker,
+          nome: dto.nome,
+          precoMedio: dto.precoMedio,
+          quantidade: dto.quantidade,
+          rendaFixaDetalhe: rendaFixaData ? { create: rendaFixaData } : undefined,
+        },
       });
     });
   }
 
   async atualizar(userId: string, id: string, dto: UpsertInvestimentoDto, carteira: TipoCarteira = CARTEIRA_PADRAO) {
     await this.garantirDono(userId, id, carteira);
-    return this.prisma.investimento.update({
+    const rendaFixaData = this.paraDadosRendaFixa(dto);
+
+    const investimento = await this.prisma.investimento.update({
       where: { id },
       data: {
         tipo: dto.tipo,
@@ -266,6 +429,34 @@ export class InvestimentoService {
         quantidade: dto.quantidade,
       },
     });
+
+    // Escrita separada (não nested) porque o caso "apagar o detalhe órfão" (trocou de renda_fixa
+    // pra ação/FII) usa deleteMany — idempotente mesmo se nunca existiu — em vez do `delete`
+    // nested do Prisma, que lança erro se não houver linha pra apagar.
+    if (rendaFixaData) {
+      await this.prisma.rendaFixaDetalhe.upsert({
+        where: { investimentoId: id },
+        create: { investimentoId: id, ...rendaFixaData },
+        update: rendaFixaData,
+      });
+    } else if (dto.tipo !== 'renda_fixa') {
+      await this.prisma.rendaFixaDetalhe.deleteMany({ where: { investimentoId: id } });
+    }
+
+    return investimento;
+  }
+
+  /** Converte o DTO pro shape do Prisma — null quando não é renda fixa ou o detalhe não foi
+   * enviado (preserva o comportamento antigo: posição sem RendaFixaDetalhe, valorAtual estático). */
+  private paraDadosRendaFixa(dto: UpsertInvestimentoDto) {
+    if (dto.tipo !== 'renda_fixa' || !dto.rendaFixa) return null;
+    return {
+      tipoRentabilidade: dto.rendaFixa.tipoRentabilidade,
+      percentualOuTaxa: dto.rendaFixa.percentualOuTaxa,
+      dataAplicacao: new Date(dto.rendaFixa.dataAplicacao),
+      dataVencimento: new Date(dto.rendaFixa.dataVencimento),
+      isentoIr: dto.rendaFixa.isentoIr ?? false,
+    };
   }
 
   async remover(userId: string, id: string, carteira: TipoCarteira = CARTEIRA_PADRAO): Promise<void> {
@@ -334,29 +525,67 @@ export class InvestimentoService {
   }
 
   /**
-   * Ganho de cada holding no mês: (cotação do mês − preço médio) × quantidade. Renda fixa
-   * não tem ticker/cotação de mercado no ranking, então fica sempre com valores null.
+   * Ganho de cada holding no mês: (cotação do mês − preço médio) × quantidade. Renda fixa não
+   * tem ticker/cotação de mercado — com RendaFixaDetalhe cadastrado, projeta o valor bruto por
+   * juros (RendaFixaService) congelado no fim do anoMes selecionado (ou hoje, se o mês
+   * selecionado ainda não terminou — evita projetar rendimento "do futuro" além da data real).
+   * Sem RendaFixaDetalhe (posições antigas, ou tipo!='renda_fixa'), cai no valor estático de
+   * sempre (precoMedio*quantidade, ganho null).
    */
   async calcularGanhos(userId: string, anoMes: string, carteira: TipoCarteira = CARTEIRA_PADRAO): Promise<GanhoInvestimento[]> {
     const investimentos = await this.listar(userId, carteira);
+    const [ano, mes] = anoMes.split('-').map(Number);
+    const fimDoMes = new Date(ano, mes, 0);
+    const hoje = new Date();
+    const dataReferenciaRendaFixa = fimDoMes < hoje ? fimDoMes : hoje;
     const tickers = investimentos
       .map((i) => i.ticker)
       .filter((t): t is string => t !== null);
 
-    const cotacoes = tickers.length
-      ? await this.prisma.indicadorMensal.findMany({
-          where: { anoMes, ticker: { in: tickers } },
-          select: { ticker: true, precoFechamento: true },
-        })
-      : [];
-    const cotacaoPorTicker = new Map(cotacoes.map((c) => [c.ticker, c.precoFechamento]));
+    const [cotacoes, cotacoesFii, acoesInfo, fiisInfo] = tickers.length
+      ? await Promise.all([
+          this.prisma.indicadorMensal.findMany({
+            where: { anoMes, ticker: { in: tickers } },
+            select: { ticker: true, precoFechamento: true },
+          }),
+          // Mesmo ticker nunca aparece nas duas fontes (ações e FII são universos disjuntos),
+          // então dá pra juntar os dois mapas sem risco de um sobrescrever o outro por engano.
+          this.prisma.indicadorMensalFii.findMany({
+            where: { anoMes, ticker: { in: tickers } },
+            select: { ticker: true, precoFechamento: true },
+          }),
+          this.prisma.acao.findMany({ where: { ticker: { in: tickers } }, select: { ticker: true, setor: true } }),
+          this.prisma.fii.findMany({ where: { ticker: { in: tickers } }, select: { ticker: true, segmento: true } }),
+        ])
+      : [[], [], [], []];
+    const cotacaoPorTicker = new Map([...cotacoes, ...cotacoesFii].map((c) => [c.ticker, c.precoFechamento]));
+    const setorPorTicker = new Map<string, string | null>(acoesInfo.map((a) => [a.ticker, a.setor]));
+    const segmentoPorTicker = new Map<string, string | null>(fiisInfo.map((f) => [f.ticker, f.segmento]));
 
     return investimentos.map((inv) => {
       const cotacaoAtual = inv.ticker ? (cotacaoPorTicker.get(inv.ticker) ?? null) : null;
       const valorInvestido = inv.precoMedio * inv.quantidade;
-      const valorAtual = cotacaoAtual != null ? cotacaoAtual * inv.quantidade : null;
+
+      let valorAtual = cotacaoAtual != null ? cotacaoAtual * inv.quantidade : null;
+      if (inv.tipo === 'renda_fixa' && inv.rendaFixaDetalhe) {
+        const detalhe = inv.rendaFixaDetalhe;
+        valorAtual = this.rendaFixa.calcularResultado(
+          valorInvestido,
+          { ...detalhe, tipoRentabilidade: detalhe.tipoRentabilidade as TipoRentabilidadeRendaFixa },
+          dataReferenciaRendaFixa,
+        ).valorBruto;
+      }
+
       const ganho = valorAtual != null ? valorAtual - valorInvestido : null;
       const ganhoPercentual = ganho != null && valorInvestido > 0 ? (ganho / valorInvestido) * 100 : null;
+
+      const classificacao = !inv.ticker
+        ? null
+        : inv.tipo === 'acao'
+          ? setorPorTicker.get(inv.ticker) ?? null
+          : inv.tipo === 'fii'
+            ? segmentoPorTicker.get(inv.ticker) ?? null
+            : null;
 
       return {
         id: inv.id,
@@ -368,10 +597,125 @@ export class InvestimentoService {
         cotacaoAtual,
         valorInvestido,
         valorAtual,
+        classificacao,
         ganho,
         ganhoPercentual,
       };
     });
+  }
+
+  /**
+   * Visão de diversificação pra gráfico (macro Ações/FIIs/Renda Fixa + drill-down por setor de
+   * ação / tipo de fundo de FII) — deliberadamente separado de getBalanceamentoPorSetor, que
+   * compara contra ALVO configurado (AlocacaoSetor) e carrega semântica de rebalanceamento
+   * (sobrealocado/subalocado). Isso aqui é só composição atual, sem comparação com meta nenhuma.
+   * Reusa a mesma lógica de cotação dupla (ação+FII) de calcularGanhos, mas junto com
+   * setor/tipoFundo pra poder agrupar — por isso não reaproveita calcularGanhos diretamente
+   * (seu retorno não carrega essa classificação).
+   */
+  async getDiversificacao(userId: string, anoMes: string, carteira: TipoCarteira = CARTEIRA_PADRAO): Promise<DiversificacaoCarteira> {
+    const investimentos = await this.listar(userId, carteira);
+    const tickers = investimentos.map((i) => i.ticker).filter((t): t is string => t !== null);
+
+    // `in: []` (lista vazia) já volta zero linhas no Prisma — não precisa de branch condicional
+    // separado só por não ter ticker nenhum na carteira.
+    const [cotacoesAcao, cotacoesFii, acoesInfo, fiisInfo] = await Promise.all([
+      this.prisma.indicadorMensal.findMany({ where: { anoMes, ticker: { in: tickers } }, select: { ticker: true, precoFechamento: true } }),
+      this.prisma.indicadorMensalFii.findMany({ where: { anoMes, ticker: { in: tickers } }, select: { ticker: true, precoFechamento: true } }),
+      this.prisma.acao.findMany({ where: { ticker: { in: tickers } }, select: { ticker: true, setor: true } }),
+      this.prisma.fii.findMany({ where: { ticker: { in: tickers } }, select: { ticker: true, tipoFundo: true } }),
+    ]);
+
+    const cotacaoPorTicker = new Map<string, number | null>(
+      [...cotacoesAcao, ...cotacoesFii].map((c) => [c.ticker, c.precoFechamento]),
+    );
+    const setorPorTicker = new Map<string, string | null>(acoesInfo.map((a) => [a.ticker, a.setor]));
+    const tipoFundoPorTicker = new Map<string, string | null>(fiisInfo.map((f) => [f.ticker, f.tipoFundo]));
+
+    const valorMacro = { acao: 0, fii: 0, renda_fixa: 0 } as Record<string, number>;
+    const valorPorSetor = new Map<string, number>();
+    const valorPorTipoFundo = new Map<string, number>();
+
+    for (const inv of investimentos) {
+      const cotacaoAtual = inv.ticker ? (cotacaoPorTicker.get(inv.ticker) ?? null) : null;
+      const valor = cotacaoAtual != null ? cotacaoAtual * inv.quantidade : inv.precoMedio * inv.quantidade;
+
+      valorMacro[inv.tipo] = (valorMacro[inv.tipo] ?? 0) + valor;
+
+      if (inv.tipo === 'acao') {
+        const setor: string = (inv.ticker ? setorPorTicker.get(inv.ticker) : null) ?? 'Sem setor';
+        valorPorSetor.set(setor, (valorPorSetor.get(setor) ?? 0) + valor);
+      } else if (inv.tipo === 'fii') {
+        const tipoFundo: string = (inv.ticker ? tipoFundoPorTicker.get(inv.ticker) : null) ?? 'Sem classificação';
+        valorPorTipoFundo.set(tipoFundo, (valorPorTipoFundo.get(tipoFundo) ?? 0) + valor);
+      }
+    }
+
+    const totalGeral = Object.values(valorMacro).reduce((acc, v) => acc + v, 0);
+    const totalAcoes = valorMacro['acao'] ?? 0;
+    const totalFiis = valorMacro['fii'] ?? 0;
+
+    const LABEL_MACRO: Record<string, string> = { acao: 'Ações', fii: 'FIIs', renda_fixa: 'Renda Fixa' };
+    const paraFatias = (mapa: Map<string, number> | Record<string, number>, total: number, label?: Record<string, string>): FatiaDiversificacao[] => {
+      const entradas = mapa instanceof Map ? Array.from(mapa.entries()) : Object.entries(mapa);
+      return entradas
+        .filter(([, valor]) => valor > 0)
+        .map(([chave, valor]) => ({
+          chave: label?.[chave] ?? chave,
+          valor,
+          percentual: total > 0 ? (valor / total) * 100 : 0,
+        }))
+        .sort((a, b) => b.valor - a.valor);
+    };
+
+    return {
+      macro: paraFatias(valorMacro, totalGeral, LABEL_MACRO),
+      porSetorAcao: paraFatias(valorPorSetor, totalAcoes),
+      porTipoFundoFii: paraFatias(valorPorTipoFundo, totalFiis),
+    };
+  }
+
+  /**
+   * Compara a composição macro atual (Ações/FIIs/Renda Fixa) contra o alvo configurado em
+   * Carteira (percentualRendaFixa sobre o total; percentualAcoes/percentualFiis dentro da
+   * renda variável) — mesma ideia de getBalanceamentoPorSetor, mas no nível mais alto da
+   * carteira, pra responder "falta diversificar quanto?" na visão geral de /investimentos.
+   */
+  async getResumoDiversificacao(userId: string, anoMes: string, carteira: TipoCarteira = CARTEIRA_PADRAO): Promise<ResumoDiversificacao> {
+    const [diversificacao, config] = await Promise.all([
+      this.getDiversificacao(userId, anoMes, carteira),
+      this.prisma.portfolioConfig.findUnique({ where: { userId } }),
+    ]);
+    const percentualEstouro = config?.percentualEstouro ?? PERCENTUAL_ESTOURO_PADRAO;
+
+    const valorPorChave = new Map(diversificacao.macro.map((f) => [f.chave, f.valor]));
+    const totalGeral = diversificacao.macro.reduce((soma, f) => soma + f.valor, 0);
+
+    const alvoRendaFixa = config?.percentualRendaFixa ?? 0;
+    const alvoAcoes = config ? (100 - config.percentualRendaFixa) * (config.percentualAcoes / 100) : 0;
+    const alvoFiis = config ? (100 - config.percentualRendaFixa) * (config.percentualFiis / 100) : 0;
+
+    const alvosPorChave: [string, number][] = [
+      ['Ações', alvoAcoes],
+      ['FIIs', alvoFiis],
+      ['Renda Fixa', alvoRendaFixa],
+    ];
+
+    const macro: BalanceamentoMacro[] = alvosPorChave.map(([chave, percentualAlvo]) => {
+      const valorAtual = valorPorChave.get(chave) ?? 0;
+      const percentualAtual = totalGeral > 0 ? (valorAtual / totalGeral) * 100 : 0;
+      const diferenca = percentualAtual - percentualAlvo;
+
+      let status: BalanceamentoMacro['status'] = 'equilibrado';
+      if (diferenca > percentualEstouro) status = 'sobrealocado';
+      else if (diferenca < -percentualEstouro) status = 'subalocado';
+
+      return { chave, valorAtual, percentualAtual, percentualAlvo, diferenca, status };
+    });
+
+    const percentualFaltante = macro.reduce((soma, m) => soma + Math.abs(m.diferenca), 0) / 2;
+
+    return { macro, percentualDiversificado: 100 - percentualFaltante, percentualFaltante };
   }
 
   /**
@@ -449,6 +793,96 @@ export class InvestimentoService {
   }
 
   /**
+   * Espelha construirContextoRebalanceamento, mas pra FII agrupado por Segmento. Mais simples
+   * que a versão de ação: não tem tipoRanking/híbrido (FII só tem 1 fonte de ranking,
+   * FiiRankingService.getRanking) — busca o ranking inteiro 1x e já usa pra montar os campos de
+   * score de cada FII do contexto, sem query extra por ticker.
+   */
+  async construirContextoRebalanceamentoFii(
+    userId: string,
+    anoMes: string,
+    carteira: TipoCarteira,
+  ): Promise<ContextoRebalanceamentoFii | null> {
+    const [investimentos, ganhos, config, ranking] = await Promise.all([
+      this.listar(userId, carteira),
+      this.calcularGanhos(userId, anoMes, carteira),
+      this.prisma.portfolioConfig.findUnique({ where: { userId }, include: { alocacoesSegmentoFii: true } }),
+      this.fiiRanking.getRanking(anoMes),
+    ]);
+
+    const fiisInv = investimentos.filter((i) => i.tipo === 'fii' && i.ticker);
+    if (!fiisInv.length) return null;
+
+    const tickers = fiisInv.map((f) => f.ticker as string);
+    const fiiInfos = await this.prisma.fii.findMany({ where: { ticker: { in: tickers } }, select: { ticker: true, segmento: true } });
+
+    const segmentoPorTicker = new Map(fiiInfos.map((f) => [f.ticker, f.segmento]));
+    const scorePorTicker = new Map(ranking.map((r) => [r.ticker, r]));
+    const ganhoPorId = new Map(ganhos.map((g) => [g.id, g]));
+    const valorTotalFiis = fiisInv.reduce((acc, f) => acc + (ganhoPorId.get(f.id)?.valorAtual ?? 0), 0);
+
+    const valorPorSegmento = new Map<string, number>();
+    for (const f of fiisInv) {
+      const segmento = segmentoPorTicker.get(f.ticker as string) ?? null;
+      if (!segmento) continue;
+      valorPorSegmento.set(segmento, (valorPorSegmento.get(segmento) ?? 0) + (ganhoPorId.get(f.id)?.valorAtual ?? 0));
+    }
+
+    const alocacoesAlvo = new Map((config?.alocacoesSegmentoFii ?? []).map((a) => [a.segmento, a.percentual]));
+    const percentualEstouro = config?.percentualEstouro ?? PERCENTUAL_ESTOURO_PADRAO;
+
+    const fiisPorSegmento = new Map<string, FiiContextoSegmento[]>();
+    for (const f of fiisInv) {
+      const ticker = f.ticker as string;
+      const segmento = segmentoPorTicker.get(ticker) ?? null;
+      if (!segmento) continue;
+      const s = scorePorTicker.get(ticker);
+      if (!fiisPorSegmento.has(segmento)) fiisPorSegmento.set(segmento, []);
+      fiisPorSegmento.get(segmento)!.push({
+        id: f.id,
+        ticker,
+        scoreFinal: s?.scoreFinal ?? null,
+        scoreLiquidezPorte: s?.scoreLiquidezPorte ?? null,
+        scoreValuation: s?.scoreValuation ?? null,
+      });
+    }
+
+    return {
+      fiis: fiisInv.map((f) => ({ id: f.id, ticker: f.ticker as string })),
+      valorTotalFiis,
+      valorPorSegmento,
+      alocacoesAlvo,
+      percentualEstouro,
+      fiisPorSegmento,
+    };
+  }
+
+  /**
+   * Espelha calcularValorCompraPorSetor, mas pra FII: gate de qualidade usa scoreLiquidezPorte
+   * (filtra fundo pequeno/ilíquido do rateio, mesmo espírito do corte de scoreQualidade de
+   * ação) e o peso proporcional usa scoreValuation (é literalmente o P/VP do fundo — mesmo
+   * papel que scorePreco tem pra ação: mais desconto, maior fatia do aporte).
+   */
+  calcularValorCompraPorSegmentoFii(
+    fiisDoSegmento: FiiContextoSegmento[],
+    valorDisponivel: number,
+    corteGate = CORTE_QUALIDADE_SPLIT_APORTE_PADRAO,
+  ): Map<string, number> {
+    const qualificados = fiisDoSegmento.filter(
+      (x) => (x.scoreLiquidezPorte ?? 0) >= corteGate && x.scoreValuation != null,
+    );
+    const base = qualificados.length ? qualificados : fiisDoSegmento;
+    const somaScoreValuation = base.reduce((acc, x) => acc + (x.scoreValuation ?? 0), 0);
+
+    const resultado = new Map<string, number>();
+    for (const x of base) {
+      const proporcao = somaScoreValuation > 0 ? (x.scoreValuation ?? 0) / somaScoreValuation : 1 / base.length;
+      resultado.set(x.id, valorDisponivel * proporcao);
+    }
+    return resultado;
+  }
+
+  /**
    * Quanto cada setor configurado representa hoje vs. o alvo — visão limpa em número e % pra
    * um painel de "carteira desbalanceada", sem precisar vasculhar a tabela de recomendações
    * ação por ação. Inclui setores com alvo configurado mas ZERO ações hoje ("setor descoberto",
@@ -489,6 +923,129 @@ export class InvestimentoService {
         diferenca,
         status,
         semNenhumaAcao: valorAtual <= 0 && percentualAlvo > 0,
+      });
+    }
+
+    return resultado.sort((a, b) => Math.abs(b.diferenca) - Math.abs(a.diferenca));
+  }
+
+  /**
+   * Espelha getBalanceamentoPorSetor, mas pra FII: alvo configurado em AlocacaoSegmentoFii
+   * (dentro de "FIIs" na tela de Carteira), real agora vindo de Fii.segmento (catálogo real da
+   * Status Invest, ver IngestionFiiService) — não precisa de um "construirContextoRebalanceamento"
+   * próprio porque FII ainda não tem score/ranking pra ratear aporte entre candidatos do mesmo
+   * segmento (isso é só concentração, igual ao painel de setor de ação).
+   */
+  async getBalanceamentoPorSegmentoFii(userId: string, anoMes: string, carteira: TipoCarteira = CARTEIRA_PADRAO): Promise<BalanceamentoSegmentoFii[]> {
+    const [config, investimentos, ganhos] = await Promise.all([
+      this.prisma.portfolioConfig.findUnique({ where: { userId }, include: { alocacoesSegmentoFii: true } }),
+      this.listar(userId, carteira),
+      this.calcularGanhos(userId, anoMes, carteira),
+    ]);
+
+    const alocacoesAlvo = new Map((config?.alocacoesSegmentoFii ?? []).map((a) => [a.segmento, a.percentual]));
+    const percentualEstouro = config?.percentualEstouro ?? PERCENTUAL_ESTOURO_PADRAO;
+
+    const fiisInv = investimentos.filter((i) => i.tipo === 'fii' && i.ticker);
+    const tickers = fiisInv.map((f) => f.ticker as string);
+    const fiiInfos = tickers.length
+      ? await this.prisma.fii.findMany({ where: { ticker: { in: tickers } }, select: { ticker: true, segmento: true } })
+      : [];
+    const segmentoPorTicker = new Map<string, string | null>(fiiInfos.map((f) => [f.ticker, f.segmento]));
+    const ganhoPorId = new Map(ganhos.map((g) => [g.id, g]));
+
+    const valorPorSegmento = new Map<string, number>();
+    let valorTotalFiis = 0;
+    for (const f of fiisInv) {
+      const valorAtual = ganhoPorId.get(f.id)?.valorAtual ?? 0;
+      valorTotalFiis += valorAtual;
+      const segmento = segmentoPorTicker.get(f.ticker as string) ?? null;
+      if (!segmento) continue;
+      valorPorSegmento.set(segmento, (valorPorSegmento.get(segmento) ?? 0) + valorAtual);
+    }
+
+    const segmentos = new Set([...alocacoesAlvo.keys(), ...valorPorSegmento.keys()]);
+
+    const resultado: BalanceamentoSegmentoFii[] = [];
+    for (const segmento of segmentos) {
+      const valorAtual = valorPorSegmento.get(segmento) ?? 0;
+      const percentualAtual = valorTotalFiis > 0 ? (valorAtual / valorTotalFiis) * 100 : 0;
+      const percentualAlvo = alocacoesAlvo.get(segmento) ?? 0;
+      const diferenca = percentualAtual - percentualAlvo;
+
+      let status: BalanceamentoSegmentoFii['status'] = 'equilibrado';
+      if (diferenca > percentualEstouro) status = 'sobrealocado';
+      else if (diferenca < -percentualEstouro) status = 'subalocado';
+
+      resultado.push({
+        segmento,
+        valorAtual,
+        percentualAtual,
+        percentualAlvo,
+        diferenca,
+        status,
+        semNenhumFii: valorAtual <= 0 && percentualAlvo > 0,
+      });
+    }
+
+    return resultado.sort((a, b) => Math.abs(b.diferenca) - Math.abs(a.diferenca));
+  }
+
+  /**
+   * Espelha getBalanceamentoPorSegmentoFii, mas pro "setor" de FII (Fii.tipoFundo — Fundo de
+   * Tijolo/Papel/Misto), alvo em AlocacaoSetorFii. Dimensão independente de segmento: um FII
+   * logístico (segmento="Imóveis Industriais e Logísticos") é um Fundo de Tijolo (setor) — as
+   * duas classificações coexistem sem conflito, por isso dois painéis separados em vez de um só.
+   */
+  async getBalanceamentoPorSetorFii(userId: string, anoMes: string, carteira: TipoCarteira = CARTEIRA_PADRAO): Promise<BalanceamentoSetorFii[]> {
+    const [config, investimentos, ganhos] = await Promise.all([
+      this.prisma.portfolioConfig.findUnique({ where: { userId }, include: { alocacoesSetorFii: true } }),
+      this.listar(userId, carteira),
+      this.calcularGanhos(userId, anoMes, carteira),
+    ]);
+
+    const alocacoesAlvo = new Map((config?.alocacoesSetorFii ?? []).map((a) => [a.setor, a.percentual]));
+    const percentualEstouro = config?.percentualEstouro ?? PERCENTUAL_ESTOURO_PADRAO;
+
+    const fiisInv = investimentos.filter((i) => i.tipo === 'fii' && i.ticker);
+    const tickers = fiisInv.map((f) => f.ticker as string);
+    const fiiInfos = tickers.length
+      ? await this.prisma.fii.findMany({ where: { ticker: { in: tickers } }, select: { ticker: true, tipoFundo: true } })
+      : [];
+    const setorPorTicker = new Map<string, string | null>(fiiInfos.map((f) => [f.ticker, f.tipoFundo]));
+    const ganhoPorId = new Map(ganhos.map((g) => [g.id, g]));
+
+    const valorPorSetor = new Map<string, number>();
+    let valorTotalFiis = 0;
+    for (const f of fiisInv) {
+      const valorAtual = ganhoPorId.get(f.id)?.valorAtual ?? 0;
+      valorTotalFiis += valorAtual;
+      const setor = setorPorTicker.get(f.ticker as string) ?? null;
+      if (!setor) continue;
+      valorPorSetor.set(setor, (valorPorSetor.get(setor) ?? 0) + valorAtual);
+    }
+
+    const setores = new Set([...alocacoesAlvo.keys(), ...valorPorSetor.keys()]);
+
+    const resultado: BalanceamentoSetorFii[] = [];
+    for (const setor of setores) {
+      const valorAtual = valorPorSetor.get(setor) ?? 0;
+      const percentualAtual = valorTotalFiis > 0 ? (valorAtual / valorTotalFiis) * 100 : 0;
+      const percentualAlvo = alocacoesAlvo.get(setor) ?? 0;
+      const diferenca = percentualAtual - percentualAlvo;
+
+      let status: BalanceamentoSetorFii['status'] = 'equilibrado';
+      if (diferenca > percentualEstouro) status = 'sobrealocado';
+      else if (diferenca < -percentualEstouro) status = 'subalocado';
+
+      resultado.push({
+        setor,
+        valorAtual,
+        percentualAtual,
+        percentualAlvo,
+        diferenca,
+        status,
+        semNenhumFii: valorAtual <= 0 && percentualAlvo > 0,
       });
     }
 
@@ -551,6 +1108,68 @@ export class InvestimentoService {
       pesoPreco,
       pesoFinal,
       valorTotalCarteira,
+    };
+  }
+
+  /**
+   * Espelha getSaudeCarteira, mas pra FII: busca o ranking de FII inteiro (FiiRankingService,
+   * já calcula os 4 pilares on demand) e pondera só os tickers que o usuário possui pelo valor
+   * atual — mesmo critério "sem score = fora do rateio" (tickers fora do universo elegível do
+   * ranking, ex: liquidez muito baixa, simplesmente não entram na média, não são penalizados
+   * como zero).
+   */
+  async getSaudeCarteiraFii(userId: string, anoMes: string, carteira: TipoCarteira = CARTEIRA_PADRAO): Promise<SaudeCarteiraFii> {
+    const vazio: SaudeCarteiraFii = {
+      scoreValuationMedio: null,
+      scoreRendaMedio: null,
+      scoreLiquidezPorteMedio: null,
+      scorePreservacaoMedio: null,
+      scoreFinalMedio: null,
+      pesoValuation: 0,
+      pesoRenda: 0,
+      pesoLiquidezPorte: 0,
+      pesoPreservacao: 0,
+      pesoFinal: 0,
+      valorTotalFiis: 0,
+    };
+
+    const investimentos = await this.listar(userId, carteira);
+    const fiis = investimentos.filter((i) => i.tipo === 'fii' && i.ticker);
+    const ganhos = await this.calcularGanhos(userId, anoMes, carteira);
+    const ganhoPorId = new Map(ganhos.map((g) => [g.id, g]));
+    const valorTotalFiis = fiis.reduce((acc, f) => acc + (ganhoPorId.get(f.id)?.valorAtual ?? 0), 0);
+    if (!fiis.length) return { ...vazio, valorTotalFiis };
+
+    const ranking = await this.fiiRanking.getRanking(anoMes);
+    const scorePorTicker = new Map(ranking.map((r) => [r.ticker, r]));
+
+    let somaValuation = 0, somaRenda = 0, somaLiquidezPorte = 0, somaPreservacao = 0, somaFinal = 0;
+    let pesoValuation = 0, pesoRenda = 0, pesoLiquidezPorte = 0, pesoPreservacao = 0, pesoFinal = 0;
+
+    for (const f of fiis) {
+      const score = scorePorTicker.get(f.ticker as string);
+      const valorAtual = ganhoPorId.get(f.id)?.valorAtual;
+      if (!score || valorAtual == null || valorAtual <= 0) continue;
+
+      if (score.scoreValuation != null) { somaValuation += valorAtual * score.scoreValuation; pesoValuation += valorAtual; }
+      if (score.scoreRenda != null) { somaRenda += valorAtual * score.scoreRenda; pesoRenda += valorAtual; }
+      if (score.scoreLiquidezPorte != null) { somaLiquidezPorte += valorAtual * score.scoreLiquidezPorte; pesoLiquidezPorte += valorAtual; }
+      if (score.scorePreservacao != null) { somaPreservacao += valorAtual * score.scorePreservacao; pesoPreservacao += valorAtual; }
+      if (score.scoreFinal != null) { somaFinal += valorAtual * score.scoreFinal; pesoFinal += valorAtual; }
+    }
+
+    return {
+      scoreValuationMedio: pesoValuation > 0 ? somaValuation / pesoValuation : null,
+      scoreRendaMedio: pesoRenda > 0 ? somaRenda / pesoRenda : null,
+      scoreLiquidezPorteMedio: pesoLiquidezPorte > 0 ? somaLiquidezPorte / pesoLiquidezPorte : null,
+      scorePreservacaoMedio: pesoPreservacao > 0 ? somaPreservacao / pesoPreservacao : null,
+      scoreFinalMedio: pesoFinal > 0 ? somaFinal / pesoFinal : null,
+      pesoValuation,
+      pesoRenda,
+      pesoLiquidezPorte,
+      pesoPreservacao,
+      pesoFinal,
+      valorTotalFiis,
     };
   }
 
@@ -1006,6 +1625,255 @@ export class InvestimentoService {
     // tier, o maior volume em R$ primeiro (desempate tático — não é o critério principal, ver
     // discussão do Ranking de Prioridade: mover mais dinheiro só importa entre ações já no mesmo
     // nível de urgência).
+    const RANK_PRIORIDADE: Record<PrioridadeAcao, number> = { alta: 3, media: 2, baixa: 1 };
+    resultado.sort((a, b) => {
+      const rankA = a.prioridade ? RANK_PRIORIDADE[a.prioridade] : 0;
+      const rankB = b.prioridade ? RANK_PRIORIDADE[b.prioridade] : 0;
+      if (rankA !== rankB) return rankB - rankA;
+      return Math.abs(b.valorSugerido ?? 0) - Math.abs(a.valorSugerido ?? 0);
+    });
+
+    return resultado;
+  }
+
+  /**
+   * Espelha getRecomendacoes, mas pra FII, agrupado por Segmento (ver mapeamento ação→FII no
+   * plano desta feature): mesma matriz de decisão (CategoriaAcao/PrioridadeAcao reusados sem
+   * alteração), mesmo caixa/simulação, mesmo arredondamento de lote. "Melhor do grupo" é mais
+   * simples que buscarMelhorDoGrupo — sem tipoRanking/híbrido, só filtra o ranking (já buscado
+   * no contexto) pelo mesmo segmento.
+   */
+  async getRecomendacoesFii(
+    userId: string,
+    anoMes: string,
+    carteira: TipoCarteira = CARTEIRA_PADRAO,
+    corteGateSplitAporte = CORTE_QUALIDADE_SPLIT_APORTE_PADRAO,
+  ): Promise<RecomendacaoHoldingFii[]> {
+    const contexto = await this.construirContextoRebalanceamentoFii(userId, anoMes, carteira);
+    if (!contexto) return [];
+    const { valorTotalFiis, valorPorSegmento, alocacoesAlvo, percentualEstouro, fiisPorSegmento } = contexto;
+
+    const investimentos = await this.listar(userId, carteira);
+    const fiis = investimentos.filter((i) => i.tipo === 'fii' && i.ticker);
+    if (!fiis.length) return [];
+
+    const ganhos = await this.calcularGanhos(userId, anoMes, carteira);
+    const ganhoPorId = new Map(ganhos.map((g) => [g.id, g]));
+
+    const tickers = fiis.map((f) => f.ticker as string);
+    const config = await this.prisma.portfolioConfig.findUnique({ where: { userId } });
+    const permiteFracionario = config?.permiteFracionario ?? true;
+
+    const [fiiInfos, ranking] = await Promise.all([
+      this.prisma.fii.findMany({ where: { ticker: { in: tickers } }, select: { ticker: true, nome: true, segmento: true } }),
+      this.fiiRanking.getRanking(anoMes),
+    ]);
+
+    const fiiPorTicker = new Map(fiiInfos.map((f) => [f.ticker, f]));
+    const scorePorTicker = new Map(ranking.map((r) => [r.ticker, r]));
+    const tickersJaPossuidos = new Set(tickers);
+
+    // Segmentos sobrealocados com mais de um FII: escolhe o de menor scoreFinal pra vender.
+    const idVendaEscolhidoPorSegmento = new Map<string, string>();
+    for (const [segmento, lista] of fiisPorSegmento) {
+      const percentualReal = valorTotalFiis > 0 ? ((valorPorSegmento.get(segmento) ?? 0) / valorTotalFiis) * 100 : null;
+      const percentualAlvo = alocacoesAlvo.get(segmento) ?? null;
+      if (percentualReal == null || percentualAlvo == null) continue;
+      if (percentualReal - percentualAlvo <= percentualEstouro) continue;
+
+      const comScore = lista.filter((x) => x.scoreFinal != null).sort((x, y) => x.scoreFinal! - y.scoreFinal!);
+      if (comScore.length) idVendaEscolhidoPorSegmento.set(segmento, comScore[0].id);
+    }
+
+    // Segmentos subalocados: rateia o déficit em R$ entre os FIIs qualificados (ver
+    // calcularValorCompraPorSegmentoFii) — não duplica o valor total em cada FII.
+    const valorCompraPorFii = new Map<string, number>();
+    for (const [segmento, lista] of fiisPorSegmento) {
+      if (valorTotalFiis <= 0) continue;
+      const percentualAlvo = alocacoesAlvo.get(segmento) ?? null;
+      if (percentualAlvo == null) continue;
+
+      const valorAtualSegmento = valorPorSegmento.get(segmento) ?? 0;
+      const percentualReal = (valorAtualSegmento / valorTotalFiis) * 100;
+      if (percentualAlvo - percentualReal <= percentualEstouro) continue;
+
+      const valorAlvoSegmento = (percentualAlvo / 100) * valorTotalFiis;
+      const deficitSegmento = valorAlvoSegmento - valorAtualSegmento;
+
+      for (const [id, valor] of this.calcularValorCompraPorSegmentoFii(lista, deficitSegmento, corteGateSplitAporte)) {
+        valorCompraPorFii.set(id, valor);
+      }
+    }
+
+    // Mesmo tratamento de caixa parado que ações — só existe em Simulação.
+    const caixaDisponivel =
+      carteira === 'simulacao' ? ((await this.prisma.simulacaoConfig.findUnique({ where: { userId } }))?.caixaDisponivel ?? 0) : 0;
+
+    let existeSegmentoSubalocado = false;
+    if (valorTotalFiis > 0) {
+      for (const [segmento, percentualAlvo] of alocacoesAlvo) {
+        const percentualReal = ((valorPorSegmento.get(segmento) ?? 0) / valorTotalFiis) * 100;
+        if (percentualAlvo - percentualReal > percentualEstouro) {
+          existeSegmentoSubalocado = true;
+          break;
+        }
+      }
+    }
+
+    const suprimirVendaPorCaixa = caixaDisponivel > 0 && existeSegmentoSubalocado;
+
+    const resultado: RecomendacaoHoldingFii[] = [];
+
+    for (const f of fiis) {
+      const ticker = f.ticker as string;
+      const info = fiiPorTicker.get(ticker);
+      const score = scorePorTicker.get(ticker);
+      const segmento = info?.segmento ?? null;
+
+      const percentualReal =
+        segmento && valorTotalFiis > 0 ? ((valorPorSegmento.get(segmento) ?? 0) / valorTotalFiis) * 100 : null;
+      const percentualAlvo = segmento ? (alocacoesAlvo.get(segmento) ?? null) : null;
+
+      let statusSegmento: 'subalocado' | 'sobrealocado' | 'equilibrado' | null = null;
+      let sugestaoRebalanceamento: 'comprar' | 'vender' | null = null;
+      let valorSugerido: number | null = null;
+      let quantidadeSugerida: number | null = null;
+      let escolhidaParaVender = false;
+
+      if (percentualReal != null && percentualAlvo != null && segmento) {
+        const diff = percentualReal - percentualAlvo;
+        const valorAlvoSegmento = (percentualAlvo / 100) * valorTotalFiis;
+        const valorAtualSegmento = valorPorSegmento.get(segmento) ?? 0;
+
+        if (diff > percentualEstouro) {
+          statusSegmento = 'sobrealocado';
+          const escolhidoId = idVendaEscolhidoPorSegmento.get(segmento);
+          escolhidaParaVender = !escolhidoId || escolhidoId === f.id;
+          if (escolhidaParaVender) {
+            sugestaoRebalanceamento = 'vender';
+            const valorPosicaoAtual = ganhoPorId.get(f.id)?.valorAtual ?? ganhoPorId.get(f.id)?.valorInvestido ?? 0;
+            valorSugerido = Math.min(valorAtualSegmento - valorAlvoSegmento, valorPosicaoAtual);
+          }
+        } else if (diff < -percentualEstouro) {
+          statusSegmento = 'subalocado';
+          const valorSplit = valorCompraPorFii.get(f.id);
+          if (valorSplit != null) {
+            sugestaoRebalanceamento = 'comprar';
+            valorSugerido = valorSplit;
+          }
+        } else {
+          statusSegmento = 'equilibrado';
+        }
+      }
+
+      // Mesma regra de lote/fracionário que ações — FII negocia na mesma convenção B3.
+      if (sugestaoRebalanceamento != null && valorSugerido != null) {
+        const ganho = ganhoPorId.get(f.id);
+        const cotacao = ganho?.cotacaoAtual ?? null;
+        if (cotacao != null && cotacao > 0) {
+          const quantidadeBruta = valorSugerido / cotacao;
+          const quantidadeDisponivel = sugestaoRebalanceamento === 'vender' ? (ganho?.quantidade ?? null) : null;
+          const tamanhoUnidade = permiteFracionario ? TAMANHO_FRACIONARIO : TAMANHO_LOTE;
+          const quantidadeArredondada = arredondarParaLote(quantidadeBruta, quantidadeDisponivel, tamanhoUnidade);
+          if (quantidadeArredondada <= 0) {
+            sugestaoRebalanceamento = null;
+            valorSugerido = null;
+          } else {
+            valorSugerido = quantidadeArredondada * cotacao;
+            quantidadeSugerida = quantidadeArredondada;
+          }
+        }
+      }
+
+      const scoreFinal = score?.scoreFinal ?? null;
+
+      // "Melhor do grupo" — maior scoreFinal no mesmo segmento, excluindo o próprio ticker, já
+      // a partir do ranking buscado 1x no contexto (sem query nova ao banco).
+      const melhorDoGrupo = scoreFinal != null && segmento
+        ? ranking
+            .filter((r) => r.segmento === segmento && r.ticker !== ticker && r.scoreFinal != null)
+            .sort((a, b) => (b.scoreFinal ?? 0) - (a.scoreFinal ?? 0))[0] ?? null
+        : null;
+      const alvoJaPossuido = melhorDoGrupo ? tickersJaPossuidos.has(melhorDoGrupo.ticker) : false;
+
+      let categoriaAcao: CategoriaAcao = 'manter';
+      let sugestaoTroca: RecomendacaoHoldingFii['sugestaoTroca'] = null;
+      let motivoTroca: string | null = null;
+      let deltaScoreTroca: number | null = null;
+
+      if (melhorDoGrupo && scoreFinal != null) {
+        const scoreBaixo = scoreFinal < SCORE_BAIXO_MATRIZ;
+        const deltaScore = melhorDoGrupo.scoreFinal != null ? melhorDoGrupo.scoreFinal - scoreFinal : null;
+        const scoreFracoOuAtrasado = scoreBaixo || (deltaScore != null && deltaScore > DELTA_SCORE_TROCA);
+
+        if (
+          (statusSegmento === 'subalocado' || statusSegmento === 'equilibrado') &&
+          deltaScore != null &&
+          deltaScore > DELTA_SCORE_TROCA
+        ) {
+          categoriaAcao = 'troca_sugerida';
+          sugestaoTroca = { ticker: melhorDoGrupo.ticker, nome: melhorDoGrupo.nome, scoreFinal: melhorDoGrupo.scoreFinal };
+          const baseMotivo = alvoJaPossuido
+            ? 'Score bem abaixo de outro FII que você já possui no mesmo segmento — considere realocar entre eles'
+            : 'Score bem abaixo do melhor do segmento';
+          motivoTroca =
+            statusSegmento === 'subalocado'
+              ? `${baseMotivo}. Migre primeiro — a troca não muda a alocação do segmento, então ainda vai ser preciso aportar capital novo depois pra fechar o déficit`
+              : `${baseMotivo} — considere migrar mesmo com a alocação equilibrada`;
+          deltaScoreTroca = deltaScore;
+        } else if (statusSegmento === 'sobrealocado' && scoreFracoOuAtrasado && escolhidaParaVender && sugestaoRebalanceamento === 'vender') {
+          if (suprimirVendaPorCaixa) {
+            categoriaAcao = 'aguardar_caixa';
+            motivoTroca = `Segmento sobrealocado e FII fraco (score ${scoreFinal.toFixed(2)}), mas já existe caixa disponível suficiente pra investir nos segmentos subalocados — invista o caixa antes de vender`;
+            sugestaoRebalanceamento = null;
+            valorSugerido = null;
+            quantidadeSugerida = null;
+          } else {
+            categoriaAcao = 'venda_prioritaria';
+            motivoTroca = `FII fraco (score ${scoreFinal.toFixed(2)}) num segmento já sobrealocado — venda prioritária; o valor deve ser redirecionado pra um segmento subalocado, não reinvestido no mesmo segmento`;
+          }
+        }
+      }
+
+      if (categoriaAcao === 'manter') {
+        if (statusSegmento === 'subalocado' && sugestaoRebalanceamento === 'comprar') categoriaAcao = 'aportar';
+        else if (statusSegmento === 'sobrealocado' && escolhidaParaVender && sugestaoRebalanceamento === 'vender') {
+          if (suprimirVendaPorCaixa) {
+            categoriaAcao = 'aguardar_caixa';
+            motivoTroca = 'Segmento sobrealocado, mas já existe caixa disponível suficiente pra investir nos segmentos subalocados — invista o caixa antes de vender';
+            sugestaoRebalanceamento = null;
+            valorSugerido = null;
+            quantidadeSugerida = null;
+          } else {
+            categoriaAcao = 'reducao_risco';
+          }
+        }
+      }
+
+      resultado.push({
+        id: f.id,
+        ticker,
+        nome: info?.nome ?? f.nome,
+        segmento,
+        scoreFinal,
+        scoreValuation: score?.scoreValuation ?? null,
+        scoreRenda: score?.scoreRenda ?? null,
+        scoreLiquidezPorte: score?.scoreLiquidezPorte ?? null,
+        scorePreservacao: score?.scorePreservacao ?? null,
+        percentualReal,
+        percentualAlvo,
+        categoriaAcao,
+        sugestaoTroca,
+        motivoTroca,
+        deltaScoreTroca,
+        sugestaoRebalanceamento,
+        valorSugerido,
+        quantidadeSugerida,
+        prioridade: PRIORIDADE_POR_CATEGORIA[categoriaAcao],
+        alertaRisco: score?.alertaRisco ?? null,
+      });
+    }
+
     const RANK_PRIORIDADE: Record<PrioridadeAcao, number> = { alta: 3, media: 2, baixa: 1 };
     resultado.sort((a, b) => {
       const rankA = a.prioridade ? RANK_PRIORIDADE[a.prioridade] : 0;

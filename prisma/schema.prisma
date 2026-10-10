@@ -30,6 +30,8 @@ model User {
   simulacaoConfig     SimulacaoConfig?
   historicoCarteira   HistoricoCarteira[]
   operacoesFiscais    OperacaoFiscal[]
+  gastosMensais       GastoMensal[]
+  ganhosMensais       GanhoMensal[]
 
   @@map("users")
 }
@@ -241,6 +243,56 @@ model ScoreNormalizado {
 }
 
 // ============================================
+// FIIs - Catálogo + indicadores mensais (Status Invest, CategoryType=2)
+// Pipeline 100% separado de Acao/IndicadorMensal/ScoreNormalizado — sem ranking/score ainda
+// (ver IngestionFiiService), só coleta e armazena. Campos são os de fundo (DY, P/VP de cota,
+// vacância não disponível na fonte atual), não os de ação (ROE/margens não existem pra FII).
+// ============================================
+
+model Fii {
+  ticker    String   @id
+  nome      String
+  /// Tipo do fundo (Fundo de Tijolo/Papel/Misto/Fundo de Fundos) — Status Invest manda isso
+  /// no campo "sectorname", mas pra FII é tipo de fundo, não setor econômico.
+  tipoFundo String?
+  /// Segmento de atuação (Shoppings/Lajes Corporativas/Logística/Papéis/etc) — catálogo real,
+  /// mais rico que a lista hoje hardcoded em AlocacaoSegmentoFii/carteira.component.ts
+  /// (confirmado em 2026-10-08: 22 segmentos reais vs 7 provisórios no front).
+  segmento  String?
+  gestao    String?
+  updatedAt DateTime @updatedAt
+
+  indicadores IndicadorMensalFii[]
+
+  @@map("fiis")
+}
+
+model IndicadorMensalFii {
+  id     String @id @default(uuid())
+  ticker String
+  fii    Fii    @relation(fields: [ticker], references: [ticker], onDelete: Cascade)
+  anoMes String // "2026-10"
+
+  precoFechamento      Float?
+  dy                   Float?
+  pvp                  Float?
+  valorPatrimonialCota Float?
+  liquidezMediaDiaria  Float?
+  percentualCaixa      Float?
+  dividendCagr         Float?
+  cotaCagr             Float?
+  numeroCotistas       Int?
+  numeroCotas          Int?
+  patrimonio           Float?
+  lastDividend         Float?
+
+  createdAt DateTime @default(now())
+
+  @@unique([ticker, anoMes])
+  @@map("indicadores_mensais_fii")
+}
+
+// ============================================
 // PORTFOLIO - Perfil de rebalanceamento de carteira
 // ============================================
 
@@ -284,6 +336,7 @@ model PortfolioConfig {
 
   alocacoesSetor       AlocacaoSetor[]
   alocacoesSegmentoFii AlocacaoSegmentoFii[]
+  alocacoesSetorFii    AlocacaoSetorFii[]
 
   @@map("portfolio_config")
 }
@@ -299,8 +352,8 @@ model AlocacaoSetor {
   @@map("alocacoes_setor")
 }
 
-/// Segmento é uma lista provisória fixa no front (Lajes Corporativas, Shoppings, Logística,
-/// Papel/CRI, Híbrido, Fundo de Fundos, Outros) até existir ingestão real de fundamentos de FIIs.
+/// Segmento vem agora do catálogo real (Fii.segmento, ingestão Status Invest, ver
+/// IngestionFiiService) — era lista provisória fixa no front até 2026-10-08.
 model AlocacaoSegmentoFii {
   id                String          @id @default(uuid())
   portfolioConfigId String
@@ -310,6 +363,21 @@ model AlocacaoSegmentoFii {
 
   @@unique([portfolioConfigId, segmento])
   @@map("alocacoes_segmento_fii")
+}
+
+/// "Setor" de FII = tipo de fundo (Fii.tipoFundo: Fundo de Tijolo/Papel/Misto) — análogo ao
+/// Setor de ação (classificação ampla), enquanto AlocacaoSegmentoFii é o segmento de atuação
+/// (classificação estreita, ex: Logística É um Fundo de Tijolo). As duas dimensões são
+/// independentes (um FII logístico É Tijolo) — ver getBalanceamentoPorSetorFii.
+model AlocacaoSetorFii {
+  id                String          @id @default(uuid())
+  portfolioConfigId String
+  portfolioConfig   PortfolioConfig @relation(fields: [portfolioConfigId], references: [id], onDelete: Cascade)
+  setor             String
+  percentual        Float
+
+  @@unique([portfolioConfigId, setor])
+  @@map("alocacoes_setor_fii")
 }
 
 /// Posição real do usuário (não confundir com PortfolioConfig, que é só a alocação-alvo).
@@ -334,11 +402,44 @@ model Investimento {
   precoMedio Float
   quantidade Float
 
+  /// Detalhe de rentabilidade pra tipo='renda_fixa' (% CDI/prefixado, vencimento, isenção de
+  /// IR) — null pra ação/FII, e também pra renda fixa cadastrada antes desta coluna existir
+  /// (continua mostrando valorAtual estático até o usuário editar e preencher).
+  rendaFixaDetalhe RendaFixaDetalhe?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([userId, carteira])
   @@map("investimentos")
+}
+
+/// Rentabilidade de um Investimento tipo='renda_fixa' — sem isso, a posição só guarda
+/// precoMedio*quantidade estático (sem juros, ver comentário em calcularGanhos). Com isso,
+/// RendaFixaService projeta o valor bruto por juros compostos (CDI ou taxa prefixada) e aplica
+/// a tabela regressiva de IR, pra Investimento.calcularGanhos mostrar o ganho real do título.
+model RendaFixaDetalhe {
+  id             String       @id @default(uuid())
+  investimentoId String       @unique
+  investimento   Investimento @relation(fields: [investimentoId], references: [id], onDelete: Cascade)
+
+  /// "cdi" | "prefixado" — ipca+ fora desta 1ª versão (sem série histórica do IPCA coletada).
+  tipoRentabilidade String
+
+  /// % do indexador (ex: 100 = 100% do CDI) pra tipoRentabilidade='cdi'; taxa anual fixa em %
+  /// (ex: 12.5 = 12,5% a.a.) pra 'prefixado'.
+  percentualOuTaxa Float
+
+  dataAplicacao  DateTime
+  dataVencimento DateTime
+
+  /// LCI/LCA/CRI/CRA/poupança são isentos de IR pra pessoa física — zera o imposto no cálculo.
+  isentoIr Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("renda_fixa_detalhes")
 }
 
 /// Histórico de vendas da carteira REAL. A posição Investimento guarda apenas o saldo atual;
@@ -490,4 +591,60 @@ model OperacaoFiscal {
 
   @@index([userId, ticker, data])
   @@map("operacoes_fiscais")
+}
+
+// ============================================
+// FINANÇAS PESSOAIS - Ganhos e gastos mensais (orçamento doméstico)
+// Pipeline 100% isolado de Investimento/PortfolioConfig — layout replica a planilha pessoal do
+// usuário (blocos "Passivos"/"Ativos" por mês), ver plano em mutable-plotting-nova.md 2026-10-09.
+// ============================================
+
+/// Gasto recorrente mensal (conta de luz, condomínio, cartão de crédito etc). Ao abrir um
+/// anoMes sem nenhum lançamento, FinancasService clona os gastos do mês anterior mais recente
+/// (nome/formaPagamento/valor como ponto de partida, pago sempre reiniciado) — não duplicamos a
+/// linha pro mês todo, cada anoMes tem suas próprias linhas editáveis independentes.
+model GastoMensal {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  anoMes String // "2026-11"
+  nome   String
+
+  /// Livre (não enum) — catálogo de sugestões fica só no front (Pix/Boleto/Débito
+  /// Automático/Cartão de Crédito/Transferência/Dinheiro/Outro), mesmo padrão de
+  /// tipoFundo/segmento do Fii: adicionar opção nova não pede migration.
+  formaPagamento String?
+  valor          Float
+  pago           Boolean   @default(false)
+  dataVencimento DateTime?
+
+  /// Preserva a ordem de exibição/replicação entre meses (não é alfabética).
+  ordem Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, anoMes])
+  @@map("gastos_mensais")
+}
+
+/// Ganho recorrente mensal (salário, aluguel, dividendos etc). Mesma lógica de replicação de
+/// GastoMensal, sem os campos exclusivos de gasto.
+model GanhoMensal {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  anoMes   String
+  nome     String
+  valor    Float
+  recebido Boolean @default(false)
+  ordem    Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, anoMes])
+  @@map("ganhos_mensais")
 }

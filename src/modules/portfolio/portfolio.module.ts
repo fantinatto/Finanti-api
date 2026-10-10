@@ -6,6 +6,7 @@ import { PortfolioController } from './portfolio.controller';
 import { PortfolioConfigService } from './services/portfolio-config.service';
 import { RebalancingRuleService } from './services/rebalancing-rule.service';
 import { InvestimentoService } from './services/investimento.service';
+import { RendaFixaService } from './services/renda-fixa.service';
 import { SimulacaoService } from './services/simulacao.service';
 import { HistoricoCarteiraService } from './services/historico-carteira.service';
 import { PortfolioSnapshotService } from './recommendation-engine/snapshot/portfolio-snapshot.service';
@@ -32,6 +33,7 @@ import { RecommendationPolicyService } from './recommendation-engine/policy/reco
     PortfolioConfigService,
     RebalancingRuleService,
     InvestimentoService,
+    RendaFixaService,
     SimulacaoService,
     HistoricoCarteiraService,
     PortfolioSnapshotService,

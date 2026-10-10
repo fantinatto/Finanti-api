@@ -8,6 +8,7 @@ import { UsersModule } from './modules/users/users.module';
 import { MarketDataModule } from './modules/market-data/market-data.module';
 import { PortfolioModule } from './modules/portfolio/portfolio.module';
 import { FiscalModule } from './modules/fiscal/fiscal.module';
+import { FinancasModule } from './modules/financas/financas.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { FiscalModule } from './modules/fiscal/fiscal.module';
     MarketDataModule,
     PortfolioModule,
     FiscalModule,
+    FinancasModule,
   ],
   controllers: [AppController],
   providers: [AppService],

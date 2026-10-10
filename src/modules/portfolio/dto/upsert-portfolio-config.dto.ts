@@ -78,4 +78,11 @@ export class UpsertPortfolioConfigDto {
   @ValidateNested({ each: true })
   @Type(() => AlocacaoItemDto)
   alocacoesSegmentoFii: AlocacaoItemDto[];
+
+  /** "Setor" de FII = tipo de fundo (Fundo de Tijolo/Papel/Misto) — dimensão independente do
+   * segmento de atuação (ver AlocacaoSetorFii no schema). */
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => AlocacaoItemDto)
+  alocacoesSetorFii: AlocacaoItemDto[];
 }

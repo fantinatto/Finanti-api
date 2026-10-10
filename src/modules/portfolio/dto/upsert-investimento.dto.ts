@@ -1,7 +1,29 @@
-import { IsBoolean, IsDateString, IsIn, IsNumber, IsOptional, IsString, Min, MinLength } from 'class-validator';
+import { Type } from 'class-transformer';
+import { IsBoolean, IsDateString, IsIn, IsNumber, IsOptional, IsString, Min, MinLength, ValidateNested } from 'class-validator';
 
 const TIPOS_VALIDOS = ['acao', 'fii', 'renda_fixa'] as const;
 export type TipoInvestimento = (typeof TIPOS_VALIDOS)[number];
+
+const TIPOS_RENTABILIDADE_VALIDOS = ['cdi', 'prefixado'] as const;
+
+export class RendaFixaDetalheDto {
+  @IsIn(TIPOS_RENTABILIDADE_VALIDOS)
+  tipoRentabilidade: (typeof TIPOS_RENTABILIDADE_VALIDOS)[number];
+
+  @IsNumber()
+  @Min(0)
+  percentualOuTaxa: number;
+
+  @IsDateString()
+  dataAplicacao: string;
+
+  @IsDateString()
+  dataVencimento: string;
+
+  @IsOptional()
+  @IsBoolean()
+  isentoIr?: boolean;
+}
 
 export class UpsertInvestimentoDto {
   @IsIn(TIPOS_VALIDOS)
@@ -42,4 +64,11 @@ export class UpsertInvestimentoDto {
   @IsNumber()
   @Min(0)
   custosFiscais?: number;
+
+  /** Só pra tipo='renda_fixa' — ausente preserva o comportamento antigo (valorAtual estático,
+   * sem juros). Ver RendaFixaService/InvestimentoService.calcularGanhos. */
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => RendaFixaDetalheDto)
+  rendaFixa?: RendaFixaDetalheDto;
 }

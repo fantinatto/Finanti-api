@@ -1,14 +1,16 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import { StatusInvestItem, StatusInvestResponse } from '../dto/statusinvest.types';
+import { StatusInvestItem, StatusInvestResponse, StatusInvestFiiItem, StatusInvestFiiResponse } from '../dto/statusinvest.types';
 
 chromium.use(StealthPlugin());
 
 const BASE_URL = 'https://statusinvest.com.br/category/advancedsearchresultpaginated';
 const BUSCA_AVANCADA_URL = 'https://statusinvest.com.br/acoes/busca-avancada';
+const BUSCA_AVANCADA_FII_URL = 'https://statusinvest.com.br/fundos-imobiliarios/busca-avancada';
 const TAKE = 1000;
 const CATEGORY_TYPE_ACOES = 1;
+const CATEGORY_TYPE_FIIS = 2;
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -58,6 +60,29 @@ const SEARCH_SEM_FILTRO = {
   vpa: { Item1: null, Item2: null },
   lpa: { Item1: null, Item2: null },
   valormercado: { Item1: null, Item2: null },
+};
+
+/**
+ * Equivalente a SEARCH_SEM_FILTRO, mas pro screener de FII (campos completamente diferentes —
+ * confirmado via URL real compartilhada pelo usuário em 2026-10-08). Sem filtro de dy/p_vp/etc,
+ * pra trazer o universo inteiro (a URL de exemplo tinha dy>=2 embutido, que é screening pessoal,
+ * não o universo completo — mesma armadilha documentada em SEARCH_SEM_FILTRO).
+ */
+const SEARCH_SEM_FILTRO_FII = {
+  Segment: '',
+  Gestao: '',
+  my_range: '-20;100',
+  dy: { Item1: null, Item2: null },
+  p_vp: { Item1: null, Item2: null },
+  percentualcaixa: { Item1: null, Item2: null },
+  numerocotistas: { Item1: null, Item2: null },
+  dividend_cagr: { Item1: null, Item2: null },
+  cota_cagr: { Item1: null, Item2: null },
+  liquidezmediadiaria: { Item1: null, Item2: null },
+  patrimonio: { Item1: null, Item2: null },
+  valorpatrimonialcota: { Item1: null, Item2: null },
+  numerocotas: { Item1: null, Item2: null },
+  lastdividend: { Item1: null, Item2: null },
 };
 
 @Injectable()
@@ -110,6 +135,54 @@ export class StatusInvestService {
         const lista = data.list ?? [];
         resultado.push(...lista);
         this.logger.log(`Página ${paginaAtual}: ${lista.length} tickers (${resultado.length}/${data.totalResults} coletados)`);
+
+        if (resultado.length >= data.totalResults || lista.length < TAKE) break;
+        paginaAtual++;
+      }
+
+      return resultado;
+    } finally {
+      await browser.close();
+    }
+  }
+
+  /**
+   * Equivalente a buscarTodas(), mas pro universo de FII (CategoryType=2) — método isolado,
+   * nenhum código compartilhado com buscarTodas()/busca de ação alem do browser/stealth em si,
+   * pra uma falha aqui nunca impactar a coleta de ações.
+   */
+  async buscarTodasFiis(): Promise<StatusInvestFiiItem[]> {
+    const browser = await chromium.launch({ headless: true });
+
+    try {
+      const context = await browser.newContext({ userAgent: USER_AGENT });
+      const page = await context.newPage();
+
+      await page.goto(BUSCA_AVANCADA_FII_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+      const resultado: StatusInvestFiiItem[] = [];
+      let paginaAtual = 0;
+
+      while (true) {
+        const search = encodeURIComponent(JSON.stringify(SEARCH_SEM_FILTRO_FII));
+        const url = `${BASE_URL}?search=${search}&orderColumn=&isAsc=&page=${paginaAtual}&take=${TAKE}&CategoryType=${CATEGORY_TYPE_FIIS}`;
+
+        const resp = await page.evaluate(async (u) => {
+          const r = await fetch(u, { headers: { Accept: 'application/json' } });
+          return { status: r.status, body: await r.text() };
+        }, url);
+
+        if (resp.status !== 200) {
+          this.logger.error(
+            `Falha ao buscar página ${paginaAtual} de FIIs no Status Invest (status ${resp.status}): ${resp.body.slice(0, 200)}`,
+          );
+          throw new Error(`Status Invest (FII) retornou ${resp.status} na página ${paginaAtual}`);
+        }
+
+        const data = JSON.parse(resp.body) as StatusInvestFiiResponse;
+        const lista = data.list ?? [];
+        resultado.push(...lista);
+        this.logger.log(`[FII] Página ${paginaAtual}: ${lista.length} tickers (${resultado.length}/${data.totalResults} coletados)`);
 
         if (resultado.length >= data.totalResults || lista.length < TAKE) break;
         paginaAtual++;

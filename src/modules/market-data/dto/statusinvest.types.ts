@@ -42,3 +42,35 @@ export interface StatusInvestResponse {
   list: StatusInvestItem[];
   totalResults: number;
 }
+
+/**
+ * Shape da Status Invest pra FII (`CategoryType=2`, endpoint `/fundos-imobiliarios/busca-avancada`)
+ * — campos bem diferentes dos de ação, confirmado via chamada real em 2026-10-08.
+ * `sectorname` aqui é o TIPO do fundo (Fundo de Tijolo/Papel/Misto/Fundo de Fundos), não um
+ * setor econômico; `segment` é o segmento de atuação (Shoppings/Lajes Corporativas/Logística/
+ * Papéis/etc — mesmo conceito da lista hoje hardcoded em AlocacaoSegmentoFii/carteira.component.ts).
+ */
+export interface StatusInvestFiiItem {
+  ticker: string;
+  companyname: string | null;
+  price: number | null;
+  sectorname: string | null;
+  segment: string | null;
+  gestao_f: string | null;
+  dy: number | null;
+  p_vp: number | null;
+  valorpatrimonialcota: number | null;
+  liquidezmediadiaria: number | null;
+  percentualcaixa: number | null;
+  dividend_cagr: number | null;
+  cota_cagr: number | null;
+  numerocotistas: number | null;
+  numerocotas: number | null;
+  patrimonio: number | null;
+  lastdividend: number | null;
+}
+
+export interface StatusInvestFiiResponse {
+  list: StatusInvestFiiItem[];
+  totalResults: number;
+}
