@@ -235,6 +235,11 @@ interface AcaoContextoSetor {
 export interface ContextoRebalanceamento {
   acoes: { id: string; ticker: string }[];
   valorTotalAcoes: number;
+  /** max(valorTotalAcoes, valor que Ações deveria ter segundo o alvo MACRO configurado) — base
+   * usada só pro TAMANHO do déficit de setor no rateio de compra (getRecomendacoes), nunca pro
+   * % exibido no Balanceamento por setor (esse continua sobre valorTotalAcoes). Igual a
+   * valorTotalAcoes sempre que Ações não está subalocada no macro — ver alvoMacroPercentual. */
+  valorBaseRateioAcoes: number;
   valorPorSetor: Map<string, number>;
   alocacoesAlvo: Map<string, number>;
   percentualEstouro: number;
@@ -258,6 +263,8 @@ interface FiiContextoSegmento {
 export interface ContextoRebalanceamentoFii {
   fiis: { id: string; ticker: string }[];
   valorTotalFiis: number;
+  /** Espelha valorBaseRateioAcoes, mas pra FII — ver ContextoRebalanceamento. */
+  valorBaseRateioFiis: number;
   valorPorSegmento: Map<string, number>;
   alocacoesAlvo: Map<string, number>;
   percentualEstouro: number;
@@ -676,6 +683,23 @@ export class InvestimentoService {
   }
 
   /**
+   * % alvo macro de uma classe (Ação/FII/Renda Fixa) sobre o total GERAL da carteira, a partir
+   * de PortfolioConfig — percentualRendaFixa já é sobre o total; percentualAcoes/percentualFiis
+   * são dentro da renda variável (100 − percentualRendaFixa), por isso a conversão. Usado tanto
+   * em getResumoDiversificacao (exibição) quanto em construirContextoRebalanceamento(Fii)
+   * (tamanho do aporte sugerido — ver valorBaseRateioAcoes/valorBaseRateioFiis).
+   */
+  private alvoMacroPercentual(
+    config: { percentualRendaFixa: number; percentualAcoes: number; percentualFiis: number } | null,
+    chave: 'acao' | 'fii' | 'renda_fixa',
+  ): number {
+    if (!config) return 0;
+    if (chave === 'renda_fixa') return config.percentualRendaFixa;
+    const percentualDentroRendaVariavel = chave === 'acao' ? config.percentualAcoes : config.percentualFiis;
+    return (100 - config.percentualRendaFixa) * (percentualDentroRendaVariavel / 100);
+  }
+
+  /**
    * Compara a composição macro atual (Ações/FIIs/Renda Fixa) contra o alvo configurado em
    * Carteira (percentualRendaFixa sobre o total; percentualAcoes/percentualFiis dentro da
    * renda variável) — mesma ideia de getBalanceamentoPorSetor, mas no nível mais alto da
@@ -691,14 +715,10 @@ export class InvestimentoService {
     const valorPorChave = new Map(diversificacao.macro.map((f) => [f.chave, f.valor]));
     const totalGeral = diversificacao.macro.reduce((soma, f) => soma + f.valor, 0);
 
-    const alvoRendaFixa = config?.percentualRendaFixa ?? 0;
-    const alvoAcoes = config ? (100 - config.percentualRendaFixa) * (config.percentualAcoes / 100) : 0;
-    const alvoFiis = config ? (100 - config.percentualRendaFixa) * (config.percentualFiis / 100) : 0;
-
     const alvosPorChave: [string, number][] = [
-      ['Ações', alvoAcoes],
-      ['FIIs', alvoFiis],
-      ['Renda Fixa', alvoRendaFixa],
+      ['Ações', this.alvoMacroPercentual(config, 'acao')],
+      ['FIIs', this.alvoMacroPercentual(config, 'fii')],
+      ['Renda Fixa', this.alvoMacroPercentual(config, 'renda_fixa')],
     ];
 
     const macro: BalanceamentoMacro[] = alvosPorChave.map(([chave, percentualAlvo]) => {
@@ -730,10 +750,11 @@ export class InvestimentoService {
     anoMes: string,
     carteira: TipoCarteira,
   ): Promise<ContextoRebalanceamento | null> {
-    const [investimentos, ganhos, config] = await Promise.all([
+    const [investimentos, ganhos, config, diversificacao] = await Promise.all([
       this.listar(userId, carteira),
       this.calcularGanhos(userId, anoMes, carteira),
       this.prisma.portfolioConfig.findUnique({ where: { userId }, include: { alocacoesSetor: true } }),
+      this.getDiversificacao(userId, anoMes, carteira),
     ]);
 
     const acoesInv = investimentos.filter((i) => i.tipo === 'acao' && i.ticker);
@@ -755,6 +776,17 @@ export class InvestimentoService {
     const setorPorTicker = new Map(acaoInfos.map((a) => [a.ticker, a.setor]));
     const ganhoPorId = new Map(ganhos.map((g) => [g.id, g]));
     const valorTotalAcoes = acoesInv.reduce((acc, a) => acc + (ganhoPorId.get(a.id)?.valorAtual ?? 0), 0);
+
+    // Ver comentário de valorBaseRateioAcoes na interface — amplia a base do rateio de compra só
+    // quando Ações está subalocada no nível MACRO (max() nunca deixa ficar menor que hoje).
+    // Usa o total de getDiversificacao (não soma por calcularGanhos) de propósito: renda_fixa
+    // sem rendaFixaDetalhe cadastrado tem valorAtual=null em calcularGanhos (ganho desconhecido é
+    // diferente de ganho zero), mas getDiversificacao cai pro custo (precoMedio×quantidade) —
+    // é esse total que já aparece no card "Diversificação vs. alvo" que o usuário está olhando,
+    // então é esse que precisa alimentar o tamanho do aporte sugerido aqui.
+    const valorTotalCarteira = diversificacao.macro.reduce((acc, f) => acc + f.valor, 0);
+    const valorAlvoAcoesGeral = (this.alvoMacroPercentual(config, 'acao') / 100) * valorTotalCarteira;
+    const valorBaseRateioAcoes = Math.max(valorTotalAcoes, valorAlvoAcoesGeral);
 
     const valorPorSetor = new Map<string, number>();
     for (const a of acoesInv) {
@@ -785,6 +817,7 @@ export class InvestimentoService {
     return {
       acoes: acoesInv.map((a) => ({ id: a.id, ticker: a.ticker as string })),
       valorTotalAcoes,
+      valorBaseRateioAcoes,
       valorPorSetor,
       alocacoesAlvo,
       percentualEstouro,
@@ -803,11 +836,12 @@ export class InvestimentoService {
     anoMes: string,
     carteira: TipoCarteira,
   ): Promise<ContextoRebalanceamentoFii | null> {
-    const [investimentos, ganhos, config, ranking] = await Promise.all([
+    const [investimentos, ganhos, config, ranking, diversificacao] = await Promise.all([
       this.listar(userId, carteira),
       this.calcularGanhos(userId, anoMes, carteira),
       this.prisma.portfolioConfig.findUnique({ where: { userId }, include: { alocacoesSegmentoFii: true } }),
       this.fiiRanking.getRanking(anoMes),
+      this.getDiversificacao(userId, anoMes, carteira),
     ]);
 
     const fiisInv = investimentos.filter((i) => i.tipo === 'fii' && i.ticker);
@@ -820,6 +854,11 @@ export class InvestimentoService {
     const scorePorTicker = new Map(ranking.map((r) => [r.ticker, r]));
     const ganhoPorId = new Map(ganhos.map((g) => [g.id, g]));
     const valorTotalFiis = fiisInv.reduce((acc, f) => acc + (ganhoPorId.get(f.id)?.valorAtual ?? 0), 0);
+
+    // Ver comentário de valorBaseRateioAcoes/valorTotalCarteira em construirContextoRebalanceamento.
+    const valorTotalCarteira = diversificacao.macro.reduce((acc, f) => acc + f.valor, 0);
+    const valorAlvoFiisGeral = (this.alvoMacroPercentual(config, 'fii') / 100) * valorTotalCarteira;
+    const valorBaseRateioFiis = Math.max(valorTotalFiis, valorAlvoFiisGeral);
 
     const valorPorSegmento = new Map<string, number>();
     for (const f of fiisInv) {
@@ -850,6 +889,7 @@ export class InvestimentoService {
     return {
       fiis: fiisInv.map((f) => ({ id: f.id, ticker: f.ticker as string })),
       valorTotalFiis,
+      valorBaseRateioFiis,
       valorPorSegmento,
       alocacoesAlvo,
       percentualEstouro,
@@ -1342,7 +1382,7 @@ export class InvestimentoService {
   ): Promise<RecomendacaoHolding[]> {
     const contexto = await this.construirContextoRebalanceamento(userId, anoMes, carteira);
     if (!contexto) return [];
-    const { valorTotalAcoes, valorPorSetor, alocacoesAlvo, percentualEstouro, acoesPorSetor } = contexto;
+    const { valorTotalAcoes, valorBaseRateioAcoes, valorPorSetor, alocacoesAlvo, percentualEstouro, acoesPorSetor } = contexto;
 
     // Precisamos de alguns dados extras (nome/segmento, score completo, tipoRanking, hibridoRows)
     // que construirContextoRebalanceamento não expõe pra manter o contexto enxuto — busca de novo
@@ -1402,7 +1442,10 @@ export class InvestimentoService {
       const percentualReal = (valorAtualSetor / valorTotalAcoes) * 100;
       if (percentualAlvo - percentualReal <= percentualEstouro) continue; // não subalocado
 
-      const valorAlvoSetor = (percentualAlvo / 100) * valorTotalAcoes;
+      // valorBaseRateioAcoes (não valorTotalAcoes) — se Ações como um todo também está
+      // subalocada no macro, o déficit do setor é dimensionado pro total que Ações DEVERIA ter,
+      // não só pro total de hoje (ver comentário de valorBaseRateioAcoes na interface).
+      const valorAlvoSetor = (percentualAlvo / 100) * valorBaseRateioAcoes;
       const deficitSetor = valorAlvoSetor - valorAtualSetor;
 
       for (const [id, valor] of this.calcularValorCompraPorSetor(lista, deficitSetor, corteQualidadeSplitAporte)) {
@@ -1651,7 +1694,7 @@ export class InvestimentoService {
   ): Promise<RecomendacaoHoldingFii[]> {
     const contexto = await this.construirContextoRebalanceamentoFii(userId, anoMes, carteira);
     if (!contexto) return [];
-    const { valorTotalFiis, valorPorSegmento, alocacoesAlvo, percentualEstouro, fiisPorSegmento } = contexto;
+    const { valorTotalFiis, valorBaseRateioFiis, valorPorSegmento, alocacoesAlvo, percentualEstouro, fiisPorSegmento } = contexto;
 
     const investimentos = await this.listar(userId, carteira);
     const fiis = investimentos.filter((i) => i.tipo === 'fii' && i.ticker);
@@ -1697,7 +1740,8 @@ export class InvestimentoService {
       const percentualReal = (valorAtualSegmento / valorTotalFiis) * 100;
       if (percentualAlvo - percentualReal <= percentualEstouro) continue;
 
-      const valorAlvoSegmento = (percentualAlvo / 100) * valorTotalFiis;
+      // valorBaseRateioFiis (não valorTotalFiis) — ver comentário espelhado em getRecomendacoes.
+      const valorAlvoSegmento = (percentualAlvo / 100) * valorBaseRateioFiis;
       const deficitSegmento = valorAlvoSegmento - valorAtualSegmento;
 
       for (const [id, valor] of this.calcularValorCompraPorSegmentoFii(lista, deficitSegmento, corteGateSplitAporte)) {
