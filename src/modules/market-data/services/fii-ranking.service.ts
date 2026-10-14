@@ -37,6 +37,13 @@ import { calcularMediaEDesvio, EstatisticaCampo, IndicadoresMap } from '../scori
  *    itens 2 e 4 acima (sanidade e dividend trap), que dependem do yield ATUAL de propósito.
  *    23% do universo elegível (69/300) não tem dividendCagr — fica sem scoreRenda (nunca 0,
  *    mesmo princípio do item 1: scoreFinal reponderado só entre os pilares que sobram).
+ * 6. Piso de sanidade em dy (abaixo de 1%, incluindo 0) exclui o fundo do ranking inteiro — bug
+ *    real reportado em 2026-10-14: BTCR11 (dy=0,00%, sem distribuição no período coletado) foi
+ *    pro TOPO do ranking (scoreFinal 1,99, #1/296) só pela Renda alta via dividendCagr (2,62,
+ *    histórico de 5 anos), mascarando que HOJE o fundo não está pagando nada. Diferente do item
+ *    1 (dividendCagr null fica fora do rateio, nunca 0): aqui dy=0 é um sinal real e atual de
+ *    "sem renda agora", não ausência de dado — não faz sentido ranquear bem só pelo passado.
+ *    39/296 elegíveis tinham dy<1 em 2026-10 (quase todos exatamente 0,00%).
  *
  * Calculado ON DEMAND (não persistido) — mesmo padrão já usado em getDiversificacao/
  * getBalanceamentoPorSegmentoFii: universo pequeno (~400 após filtro), custo de recomputar a
@@ -53,6 +60,11 @@ const TIPOS_FUNDO_VALIDOS = ['Fundo de Tijolo', 'Fundo de Papel', 'Fundo Misto']
 const DY_MAXIMO_SANIDADE = 50;
 const PVP_MAXIMO_SANIDADE = 5;
 const LIQUIDEZ_MAXIMA_SANIDADE = 500_000_000;
+
+// Piso de sanidade do lado de baixo — ver item 6 do comentário acima. Diferente do teto (dado
+// quebrado), aqui dy=0/baixo costuma ser um dado CORRETO (fundo sem distribuição no período),
+// só que não deveria ranquear bem mesmo assim.
+const DY_MINIMO_SANIDADE = 1;
 
 // Travas de risco pós-sigmoide — ver item 4 do comentário acima.
 const SEGMENTO_DESENVOLVIMENTO = 'Fundo de Desenvolvimento';
@@ -127,6 +139,7 @@ export class FiiRankingService {
       (r) =>
         (r.liquidezMediaDiaria ?? 0) >= LIQUIDEZ_MINIMA_FII &&
         (r.liquidezMediaDiaria ?? 0) <= LIQUIDEZ_MAXIMA_SANIDADE &&
+        (r.dy ?? 0) >= DY_MINIMO_SANIDADE &&
         (r.dy ?? 0) <= DY_MAXIMO_SANIDADE &&
         (r.pvp ?? 0) <= PVP_MAXIMO_SANIDADE &&
         TIPOS_FUNDO_VALIDOS.includes(r.fii.tipoFundo ?? ''),
