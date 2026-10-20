@@ -32,6 +32,8 @@ model User {
   operacoesFiscais    OperacaoFiscal[]
   gastosMensais       GastoMensal[]
   ganhosMensais       GanhoMensal[]
+  transacoesCartao    TransacaoCartao[]
+  fechamentosMensais  FechamentoMensal[]
 
   @@map("users")
 }
@@ -647,4 +649,52 @@ model GanhoMensal {
 
   @@index([userId, anoMes])
   @@map("ganhos_mensais")
+}
+
+/// Lançamento itemizado de fatura de cartão de crédito, importado de PDF (ver
+/// ImportacaoFaturaService) — granularidade bem mais fina que GastoMensal (que só tem UMA linha
+/// "Cartão de Crédito" com o total). anoMes é a competência da FATURA (mês pedido no import),
+/// não necessariamente o mês de `data` (uma fatura de outubro pode ter compra de setembro).
+model TransacaoCartao {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  anoMes String
+  data   DateTime
+  /// Texto original da linha da fatura (nome do estabelecimento, já com "- Parcela N/M" se houver).
+  descricao String
+  /// R$ — negativo = estorno/crédito (ex: reembolso de assinatura cancelada).
+  valor Float
+  /// null até o usuário classificar — nunca um valor "padrão" tipo "Outros", pra não mascarar
+  /// transação ainda não revisada.
+  categoria String?
+  /// Marcada pelo usuário quando não reconhece a compra — fica visível pra validar depois
+  /// (ex: conferir fatura física, checar se é fraude/assinatura esquecida). Não bloqueia nada.
+  naoReconhecida Boolean @default(false)
+  /// true = linha projetada automaticamente (parcela futura ainda não confirmada em fatura real
+  /// importada); false = veio de um PDF de fatura de verdade. Quando a fatura real do mês chega,
+  /// a projeção correspondente é atualizada (previsto -> false), nunca duplicada.
+  previsto Boolean @default(false)
+  /// Nome do arquivo PDF importado — só auditoria/dedupe (reimportar o mesmo PDF não duplica).
+  /// Null também pras linhas projetadas (previsto=true), que não vêm de nenhum arquivo.
+  origemArquivo String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, anoMes])
+  @@map("transacoes_cartao")
+}
+
+/// Selo de "revisei este mês" (ver FinancasService.fecharMes) — não trava edição, só marca.
+model FechamentoMensal {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  anoMes    String
+  fechadoEm DateTime @default(now())
+
+  @@unique([userId, anoMes])
+  @@map("fechamentos_mensais")
 }

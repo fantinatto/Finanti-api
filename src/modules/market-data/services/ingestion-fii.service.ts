@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../../common/prisma/prisma.service';
 import { StatusInvestService } from './statusinvest.service';
 import { StatusInvestFiiItem } from '../dto/statusinvest.types';
+import { TIPOS_FUNDO_VALIDOS } from './fii-ranking.service';
 
 /**
  * Coleta de FII — pipeline isolado de IngestionService/ações (ver comentário do modelo Fii
@@ -117,14 +118,21 @@ export class IngestionFiiService {
    * mostrar o alvo como 100% subalocado mesmo com posição real no segmento. Vive em Fii (catálogo
    * mestre, não por anoMes) — não precisa de parâmetro de competência.
    */
-  async getSegmentos(): Promise<string[]> {
+  /**
+   * Catálogo de segmentos pra configuração de Carteira — exclui os `tipoFundo` fora de
+   * Tijolo/Papel/Misto (vazamento de classificação de setor de AÇÃO, ver TIPOS_FUNDO_VALIDOS)
+   * e já devolve o `setor` de cada segmento (mapeamento 1:1 confirmado contra a base real em
+   * 2026-10-15 — nenhum segmento tem mais de um tipoFundo) pra agrupar a tela sem precisar de
+   * um dicionário fixo mantido à mão.
+   */
+  async getSegmentos(): Promise<{ segmento: string; setor: string }[]> {
     const rows = await this.prisma.fii.findMany({
-      where: { segmento: { not: null } },
-      select: { segmento: true },
+      where: { segmento: { not: null }, tipoFundo: { in: TIPOS_FUNDO_VALIDOS } },
+      select: { segmento: true, tipoFundo: true },
       distinct: ['segmento'],
       orderBy: { segmento: 'asc' },
     });
-    return rows.map((r) => r.segmento as string);
+    return rows.map((r) => ({ segmento: r.segmento as string, setor: r.tipoFundo as string }));
   }
 
   async getResumo(anoMes: string) {

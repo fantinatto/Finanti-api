@@ -1033,18 +1033,36 @@ export class InvestimentoService {
 
   /**
    * Espelha getBalanceamentoPorSegmentoFii, mas pro "setor" de FII (Fii.tipoFundo — Fundo de
-   * Tijolo/Papel/Misto), alvo em AlocacaoSetorFii. Dimensão independente de segmento: um FII
-   * logístico (segmento="Imóveis Industriais e Logísticos") é um Fundo de Tijolo (setor) — as
-   * duas classificações coexistem sem conflito, por isso dois painéis separados em vez de um só.
+   * Tijolo/Papel/Misto). Alvo por setor NÃO é mais configurado independente (AlocacaoSetorFii,
+   * descontinuado em 2026-10-15 — gerava inconsistência: segmento somava 100% e setor podia
+   * somar 99%, sem amarra nenhuma entre os dois) — agora é SEMPRE a soma dos % de
+   * AlocacaoSegmentoFii cujo segmento mapeia pro setor (mapeamento 1:1 real, resolvido via
+   * Fii.tipoFundo, não um dicionário fixo). Estruturalmente impossível ficar inconsistente,
+   * porque setor nunca é digitado — é sempre derivado de segmento.
    */
   async getBalanceamentoPorSetorFii(userId: string, anoMes: string, carteira: TipoCarteira = CARTEIRA_PADRAO): Promise<BalanceamentoSetorFii[]> {
     const [config, investimentos, ganhos] = await Promise.all([
-      this.prisma.portfolioConfig.findUnique({ where: { userId }, include: { alocacoesSetorFii: true } }),
+      this.prisma.portfolioConfig.findUnique({ where: { userId }, include: { alocacoesSegmentoFii: true } }),
       this.listar(userId, carteira),
       this.calcularGanhos(userId, anoMes, carteira),
     ]);
 
-    const alocacoesAlvo = new Map((config?.alocacoesSetorFii ?? []).map((a) => [a.setor, a.percentual]));
+    const segmentosConfigurados = (config?.alocacoesSegmentoFii ?? []).map((a) => a.segmento);
+    const segmentoInfos = segmentosConfigurados.length
+      ? await this.prisma.fii.findMany({
+          where: { segmento: { in: segmentosConfigurados } },
+          select: { segmento: true, tipoFundo: true },
+          distinct: ['segmento'],
+        })
+      : [];
+    const setorPorSegmento = new Map(segmentoInfos.map((f) => [f.segmento, f.tipoFundo]));
+
+    const alocacoesAlvo = new Map<string, number>();
+    for (const a of config?.alocacoesSegmentoFii ?? []) {
+      const setor = setorPorSegmento.get(a.segmento);
+      if (!setor) continue; // segmento sem tipoFundo válido (vazado) — não entra em nenhum setor
+      alocacoesAlvo.set(setor, (alocacoesAlvo.get(setor) ?? 0) + a.percentual);
+    }
     const percentualEstouro = config?.percentualEstouro ?? PERCENTUAL_ESTOURO_PADRAO;
 
     const fiisInv = investimentos.filter((i) => i.tipo === 'fii' && i.ticker);

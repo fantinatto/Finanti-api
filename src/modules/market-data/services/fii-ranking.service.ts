@@ -51,7 +51,10 @@ import { calcularMediaEDesvio, EstatisticaCampo, IndicadoresMap } from '../scori
  */
 
 const LIQUIDEZ_MINIMA_FII = 1_000;
-const TIPOS_FUNDO_VALIDOS = ['Fundo de Tijolo', 'Fundo de Papel', 'Fundo Misto'];
+/** Exportado — fonte única de "o que é FII de verdade" (exclui vazamento de classificação de
+ * setor de AÇÃO, ver comentário do item 3 acima), reaproveitado também em ingestion-fii.service.ts
+ * (getSegmentos) e investimento.service.ts (getBalanceamentoPorSetorFii). */
+export const TIPOS_FUNDO_VALIDOS = ['Fundo de Tijolo', 'Fundo de Papel', 'Fundo Misto'];
 
 // Teto de sanidade (espelha o piso de liquidez, mas do lado do dado quebrado) — confirmado
 // contra dados reais em 2026-10-08: sem isso, fundos com DY=4767%/6100% e liquidez de R$10-20

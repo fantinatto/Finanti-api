@@ -146,4 +146,12 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
   get rendaFixaDetalhe() {
     return this.prisma.rendaFixaDetalhe;
   }
+
+  get transacaoCartao() {
+    return this.prisma.transacaoCartao;
+  }
+
+  get fechamentoMensal() {
+    return this.prisma.fechamentoMensal;
+  }
 }

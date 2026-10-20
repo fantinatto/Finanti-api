@@ -49,6 +49,8 @@ export class PortfolioConfigService {
       // replace-all das alocações — mais simples que diff, e o volume é pequeno (poucas dezenas de linhas)
       await tx.alocacaoSetor.deleteMany({ where: { portfolioConfigId: config.id } });
       await tx.alocacaoSegmentoFii.deleteMany({ where: { portfolioConfigId: config.id } });
+      // alocacaoSetorFii descontinuado em 2026-10-15 (setor de FII agora é derivado de segmento,
+      // ver getBalanceamentoPorSetorFii) — só deleta pra limpar linhas antigas, nunca recria.
       await tx.alocacaoSetorFii.deleteMany({ where: { portfolioConfigId: config.id } });
 
       if (dto.alocacoesSetor.length) {
@@ -66,16 +68,6 @@ export class PortfolioConfigService {
           data: dto.alocacoesSegmentoFii.map((a) => ({
             portfolioConfigId: config.id,
             segmento: a.nome,
-            percentual: a.percentual,
-          })),
-        });
-      }
-
-      if (dto.alocacoesSetorFii.length) {
-        await tx.alocacaoSetorFii.createMany({
-          data: dto.alocacoesSetorFii.map((a) => ({
-            portfolioConfigId: config.id,
-            setor: a.nome,
             percentual: a.percentual,
           })),
         });
