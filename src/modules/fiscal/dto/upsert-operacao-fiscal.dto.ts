@@ -41,4 +41,10 @@ export class UpsertOperacaoFiscalDto {
   @IsNumber()
   @Min(0)
   custos?: number;
+
+  /** IRRF retido na nota de corretagem (só vendas). Omitido = a apuração estima. */
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  irrfRetido?: number;
 }

@@ -30,6 +30,8 @@ model User {
   simulacaoConfig     SimulacaoConfig?
   historicoCarteira   HistoricoCarteira[]
   operacoesFiscais    OperacaoFiscal[]
+  ativosFiscais       AtivoFiscal[]
+  configFiscal        ConfigFiscal?
   gastosMensais       GastoMensal[]
   ganhosMensais       GanhoMensal[]
   transacoesCartao    TransacaoCartao[]
@@ -156,8 +158,8 @@ model IndicadorMensal {
 }
 
 model MediaAgrupamento {
-  id        String   @id @default(uuid())
-  tipoGrupo String   // "setor" | "subsetor" | "segmento" | "geral"
+  id        String @id @default(uuid())
+  tipoGrupo String // "setor" | "subsetor" | "segmento" | "geral"
   nomeGrupo String
   anoMes    String
 
@@ -460,7 +462,7 @@ model VendaInvestimento {
   quantidade     Float
   precoUnitario  Float
   valor          Float // quantidade * precoUnitario, antes dos custos
-  custos         Float @default(0)
+  custos         Float   @default(0)
   ganhoRealizado Float // valor - custos - quantidade * precoMedio da posição no momento da venda
 
   createdAt DateTime @default(now())
@@ -527,7 +529,7 @@ model SimulacaoConfig {
   /// Base pra contar quantas semanas se passaram desde o último aporte aplicado.
   ultimoAporteAplicadoEm DateTime?
   /// Base quando o aporte nunca foi aplicado (simulação recém-criada/reiniciada).
-  simulacaoIniciadaEm DateTime?
+  simulacaoIniciadaEm    DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -591,11 +593,52 @@ model OperacaoFiscal {
   /// reduz o resultado apurado (venda). Opcional, default 0.
   custos Float @default(0)
 
+  /// IRRF "dedo-duro" retido pela corretora nesta venda (valor da nota de corretagem). null =
+  /// apuração estima (0,005% do valor da venda em comum/FII, 1% do ganho em day trade).
+  irrfRetido Float?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([userId, ticker, data])
   @@map("operacoes_fiscais")
+}
+
+/// Dados cadastrais de um ticker pra declaração de IR (Bens e Direitos), preenchidos pelo usuário
+/// uma vez e reaproveitados todo ano. Por usuário (não global) pra um usuário não sobrescrever o
+/// cadastro de outro.
+model AtivoFiscal {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+  ticker String
+
+  /// CNPJ da companhia (ação) ou do fundo (FII), só dígitos.
+  cnpj        String?
+  razaoSocial String?
+
+  /// Só FII: administrador do fundo.
+  administrador     String?
+  cnpjAdministrador String?
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, ticker])
+  @@map("ativos_fiscais")
+}
+
+/// Configurações fiscais do usuário (corretora onde os ativos ficam custodiados).
+model ConfigFiscal {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
+
+  corretoraNome String?
+  /// Só dígitos.
+  corretoraCnpj String?
+
+  updatedAt DateTime @updatedAt
+
+  @@map("config_fiscal")
 }
 
 // ============================================
@@ -663,25 +706,25 @@ model TransacaoCartao {
   userId String
   user   User   @relation(fields: [userId], references: [uuid_usuario], onDelete: Cascade)
 
-  anoMes String
-  data   DateTime
+  anoMes         String
+  data           DateTime
   /// Texto original da linha da fatura (nome do estabelecimento, já com "- Parcela N/M" se houver).
-  descricao String
+  descricao      String
   /// R$ — negativo = estorno/crédito (ex: reembolso de assinatura cancelada).
-  valor Float
+  valor          Float
   /// null até o usuário classificar — nunca um valor "padrão" tipo "Outros", pra não mascarar
   /// transação ainda não revisada.
-  categoria String?
+  categoria      String?
   /// Marcada pelo usuário quando não reconhece a compra — fica visível pra validar depois
   /// (ex: conferir fatura física, checar se é fraude/assinatura esquecida). Não bloqueia nada.
-  naoReconhecida Boolean @default(false)
+  naoReconhecida Boolean  @default(false)
   /// true = linha projetada automaticamente (parcela futura ainda não confirmada em fatura real
   /// importada); false = veio de um PDF de fatura de verdade. Quando a fatura real do mês chega,
   /// a projeção correspondente é atualizada (previsto -> false), nunca duplicada.
-  previsto Boolean @default(false)
+  previsto       Boolean  @default(false)
   /// Nome do arquivo PDF importado — só auditoria/dedupe (reimportar o mesmo PDF não duplica).
   /// Null também pras linhas projetadas (previsto=true), que não vêm de nenhum arquivo.
-  origemArquivo String?
+  origemArquivo  String?
 
   createdAt DateTime @default(now())
 

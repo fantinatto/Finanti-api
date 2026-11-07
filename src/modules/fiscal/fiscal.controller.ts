@@ -3,11 +3,16 @@ import type { Request } from 'express';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { FiscalService } from './services/fiscal.service';
 import { UpsertOperacaoFiscalDto } from './dto/upsert-operacao-fiscal.dto';
+import { UpsertAtivoFiscalDto, UpsertConfigFiscalDto } from './dto/upsert-ativo-fiscal.dto';
+import { BensDireitosService } from './services/bens-direitos.service';
 
 @Controller('fiscal')
 @UseGuards(JwtAuthGuard)
 export class FiscalController {
-  constructor(private readonly fiscal: FiscalService) {}
+  constructor(
+    private readonly fiscal: FiscalService,
+    private readonly bensDireitos: BensDireitosService,
+  ) {}
 
   @Get('operacoes')
   async listar(@Req() req: Request, @Query('ano') ano?: string) {
@@ -33,5 +38,25 @@ export class FiscalController {
   @Get('apuracao')
   async apuracao(@Req() req: Request, @Query('ano') ano: string) {
     return this.fiscal.getApuracaoAnual(req['user'].sub, Number(ano));
+  }
+
+  @Get('bens-direitos')
+  async getBensDireitos(@Req() req: Request, @Query('ano') ano: string) {
+    return this.bensDireitos.getBensDireitos(req['user'].sub, Number(ano));
+  }
+
+  @Put('ativos/:ticker')
+  async upsertAtivo(@Req() req: Request, @Param('ticker') ticker: string, @Body() dto: UpsertAtivoFiscalDto) {
+    return this.bensDireitos.upsertAtivo(req['user'].sub, ticker, dto);
+  }
+
+  @Get('config')
+  async getConfig(@Req() req: Request) {
+    return this.bensDireitos.getConfig(req['user'].sub);
+  }
+
+  @Put('config')
+  async upsertConfig(@Req() req: Request, @Body() dto: UpsertConfigFiscalDto) {
+    return this.bensDireitos.upsertConfig(req['user'].sub, dto);
   }
 }

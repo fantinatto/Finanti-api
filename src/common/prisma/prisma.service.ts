@@ -135,6 +135,14 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     return this.prisma.operacaoFiscal;
   }
 
+  get ativoFiscal() {
+    return this.prisma.ativoFiscal;
+  }
+
+  get configFiscal() {
+    return this.prisma.configFiscal;
+  }
+
   get gastoMensal() {
     return this.prisma.gastoMensal;
   }

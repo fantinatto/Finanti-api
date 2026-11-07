@@ -1,6 +1,6 @@
 # `FEATURE_SPEC_FISCAL.md`
 
-> **Status (2026-09-25):** MVP implementado e validado — registro manual de operações,
+> **Status (2026-11-07):** MVP + DARF mensal/IRRF (seção 3.3) implementados. MVP original (2026-09-25) — registro manual de operações,
 > apuração mensal de ganho/prejuízo por bucket fiscal, e **sincronização opt-in com a carteira
 > REAL de Investimentos** (compra e venda — ver seção 3.2). **DARF, declaração anual,
 > sincronização com Simulação, detecção automática de day trade, dividendos/JCP e eventos
@@ -137,6 +137,51 @@ porta 3000 — ver `TROUBLESHOOTING.md`), operações criadas e removidas ao fin
   (resultado após compensação = R$500, prejuízo acumulado final = R$0) — todos os números batendo
   exatamente com o cálculo manual esperado.
 
+### 3.3. DARF mensal, IRRF e correção da compensação (implementado 2026-11-07)
+
+Fase 1 do plano de IR (proposta externa revisada; fases seguintes: Bens e Direitos em 31/12,
+proventos via extrato da B3, tela "Declaração IR", cadastro de CNPJ por ticker).
+
+- **Parâmetros legais em `src/modules/fiscal/fiscal.config.ts`** (alíquotas 15/20/20%, código
+  6015, limite de isenção, mínimo de DARF R$ 10, alíquotas do IRRF). Revisar a cada ano-base.
+- **Correção**: ganho em mês isento (comum, vendas ≤ R$ 20 mil) **não consome** prejuízo
+  acumulado. Antes consumia, o que inflava o DARF de meses seguintes.
+- **DARF**: um por mês (soma dos buckets), `impostoDevido − IRRF + acumulado anterior`. Valor
+  < R$ 10 não é pago: acumula pro mês seguinte (atravessa o ano). Vencimento: último dia útil
+  do mês seguinte (fim de semana, feriados nacionais fixos, Sexta-feira Santa e 31/12).
+- **IRRF "dedo-duro"**: campo opcional `OperacaoFiscal.irrfRetido` (migration
+  `20261107180000_add_operacao_fiscal_irrf`). Sem valor informado, estima 0,005% da venda
+  (comum/FII, dispensado se ≤ R$ 1 no mês) ou 1% do ganho (day trade). Saldo não usado passa
+  pros meses seguintes do mesmo ano; o que sobra em dezembro é retornado como
+  `irrfSaldoNaoCompensadoAno` (vai pra declaração).
+- **Testes**: `src/modules/fiscal/services/fiscal.service.spec.ts`.
+- **Limitações conhecidas**: day trade usa o custo médio do ticker (não o preço de compra do
+  dia); IRRF de day trade estimado por operação, não pelo resultado líquido do dia; prejuízos
+  continuam isolados por bucket.
+
+### 3.4. Bens e Direitos em 31/12 (implementado 2026-11-07)
+
+Fase 2 do plano de IR.
+
+- **Prisma** (migration `20261107200000_add_ativo_fiscal_config_fiscal`): `AtivoFiscal`
+  (por usuário + ticker: CNPJ, razão social, administrador e CNPJ do administrador pra FII) e
+  `ConfigFiscal` (corretora de custódia + CNPJ). CNPJs gravados só com dígitos, validados pelos
+  dígitos verificadores.
+- **`BensDireitosService`** (`GET /fiscal/bens-direitos?ano=`, `PUT /fiscal/ativos/:ticker`,
+  `GET/PUT /fiscal/config`): reproduz o livro e devolve, por ticker com saldo em 31/12 do ano
+  anterior ou do ano-base, quantidade, custo médio e **custo total de aquisição** (o valor
+  declarado), grupo/código (03-01 ações, 07-03 FII — em `fiscal.config.ts`), classe pelo sufixo
+  (3 ON, 4 PN, 5 PNA, 6 PNB, 11 unit; outros = "conferir"), valor de mercado só como referência
+  (última `precoFechamento` até dez do ano) e o texto de **discriminação** pronto, com
+  `[MARCADORES]` no que faltar cadastrar. Razão social pré-preenchida com `Acao.nome`/`Fii.nome`
+  (marcada como sugestão até o usuário confirmar).
+- **Divergências**: posição de hoje no livro fiscal × carteira real de `/investimentos`.
+- **Front**: aba "Bens e Direitos" em `/fiscal` (`bens-direitos.component`), com corretora,
+  totais, tabela com valores clicáveis pra copiar (formato `1234,56`), botão 📋 da discriminação
+  e cadastro inline por ticker com link pro Status Invest.
+- **Fora de escopo**: BDR/ETF (classe "OUTRO"), corretora diferente por ticker, eventos
+  corporativos (desdobramento/bonificação alteram quantidade e custo médio).
+
 ## 4. Backlog — não implementado ainda (ordem sugerida)
 
 1. ~~Sincronização automática com Investimentos~~ — **implementado 2026-09-25** (seção 3.2),
@@ -145,9 +190,8 @@ porta 3000 — ver `TROUBLESHOOTING.md`), operações criadas e removidas ao fin
    gerar operação fiscal, por decisão consciente (ver seção 3.2).
 2. **Detecção automática de day trade** — comparar compra e venda do mesmo ticker no mesmo dia
    em vez de depender do usuário marcar manualmente.
-3. **Cálculo de DARF** — aplicar alíquota (15% comum, 20% day trade/FII), código de recolhimento
-   6015, data de vencimento (último dia útil do mês seguinte).
-4. **IRRF "dedo-duro"** — 0,005% retido na fonte em operações comuns, abate do DARF devido.
+3. ~~Cálculo de DARF~~ — **implementado 2026-11-07** (seção 3.3).
+4. ~~IRRF "dedo-duro"~~ — **implementado 2026-11-07** (seção 3.3).
 5. **Dividendos/JCP/rendimentos de FII** — hoje o módulo só cobre compra/venda.
 6. **Eventos corporativos** (desdobramento, grupamento, bonificação) — afetam quantidade/custo
    médio e não são tratados hoje; um desdobramento não registrado quebraria o custo médio
