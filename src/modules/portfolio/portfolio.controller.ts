@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, Get, Param, ParseIntPipe, Post, Put, Query, Req, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, Param, ParseFloatPipe, ParseIntPipe, Post, Put, Query, Req, UseGuards } from '@nestjs/common';
 import type { Request } from 'express';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { PrismaService } from '../../common/prisma/prisma.service';
@@ -52,18 +52,25 @@ export class PortfolioController {
   }
 
   @Get('regras/sugestao-di')
-  async getSugestaoDi(@Req() req: Request, @Query('base', ParseIntPipe) base: number) {
-    const idade = await this.getIdadeUsuario(req['user'].sub);
+  async getSugestaoDi(
+    @Req() req: Request,
+    @Query('base', ParseIntPipe) base: number,
+    @Query('taxaDi', new ParseFloatPipe({ optional: true })) taxaDiInformada?: number,
+  ) {
+    const userId = req['user'].sub;
+    const idade = await this.getIdadeUsuario(userId);
 
     // Taxa cadastrada manualmente — o endpoint de futuros da brapi.dev não está disponível
-    // no plano atual (ver comentário em rebalancing.config.ts).
-    const percentualSugerido = this.regras.calcularSugestaoAjustadaPorJuros(idade, base, TAXA_DI_FIXA);
-    return { idade, base, contratoDi: CONTRATO_DI_FIXO, taxaDi: TAXA_DI_FIXA, percentualSugerido };
+    // no plano atual (ver comentário em rebalancing.config.ts). Ordem: valor digitado na tela
+    // (ainda não salvo) > valor salvo em PortfolioConfig > padrão TAXA_DI_FIXA.
+    const taxaDi = taxaDiInformada ?? (await this.getTaxaDiSalva(userId)) ?? TAXA_DI_FIXA;
+    const percentualSugerido = this.regras.calcularSugestaoAjustadaPorJuros(idade, base, taxaDi);
+    return { idade, base, contratoDi: CONTRATO_DI_FIXO, taxaDi, percentualSugerido };
   }
 
   @Get('regras/bases')
   getBasesDisponiveis() {
-    return { bases: BASES_REGRA_PADRAO };
+    return { bases: BASES_REGRA_PADRAO, contratoDi: CONTRATO_DI_FIXO, taxaDiPadrao: TAXA_DI_FIXA };
   }
 
   @Get('investimentos')
@@ -363,6 +370,11 @@ export class PortfolioController {
   @Post('simulacao/investir-caixa')
   async investirCaixa(@Req() req: Request, @Query('anoMes') anoMes: string) {
     return this.simulacao.investirCaixa(req['user'].sub, anoMes);
+  }
+
+  private async getTaxaDiSalva(userId: string): Promise<number | null> {
+    const config = await this.prisma.portfolioConfig.findUnique({ where: { userId }, select: { taxaDi: true } });
+    return config?.taxaDi ?? null;
   }
 
   private async getIdadeUsuario(userId: string): Promise<number> {

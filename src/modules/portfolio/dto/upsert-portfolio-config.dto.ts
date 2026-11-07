@@ -44,6 +44,13 @@ export class UpsertPortfolioConfigDto {
   @IsInt()
   baseRegraCustom?: number;
 
+  /** Taxa do DI1F35 (% a.a.) informada manualmente — ausente = volta pro padrão TAXA_DI_FIXA. */
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(100)
+  taxaDi?: number;
+
   @IsOptional()
   @IsIn(TIPOS_RANKING_VALIDOS)
   tipoRankingRecomendacao?: (typeof TIPOS_RANKING_VALIDOS)[number];
